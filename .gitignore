@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+*.egg
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 测试与工具缓存
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# 模型与数据缓存（严禁提交，模型文件巨大）
+hf_cache/
+models/
+*.safetensors
+*.bin
+*.pth
+*.gguf
+*.onnx
+
+# Benchmark 产物只提交 csv/json 与图表，不提交临时大文件
+benchmark/results/raw/tmp/
+
+# 日志
+*.log
+logs/
+
+# 系统文件
+.DS_Store
+Thumbs.db
