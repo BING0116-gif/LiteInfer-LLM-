@@ -14,10 +14,15 @@ __all__ = [
     "resolve_dtype",
     "peak_memory_mb",
     "process_rss_mb",
+    "SamplingParams",
+    "Sampler",
+    "ManualGenerator",
 ]
 
 _CONFIG_NAMES = {"EngineConfig", "parse_dtype", "default_hf_cache_dir"}
 _DEVICE_NAMES = {"get_device", "resolve_dtype", "peak_memory_mb", "process_rss_mb"}
+_SAMPLING_NAMES = {"SamplingParams", "Sampler"}
+_GENERATOR_NAMES = {"ManualGenerator"}
 
 
 def __getattr__(name: str):
@@ -29,4 +34,12 @@ def __getattr__(name: str):
         from liteinfer import device as _device
 
         return getattr(_device, name)
+    if name in _SAMPLING_NAMES:
+        from liteinfer import sampling as _sampling
+
+        return getattr(_sampling, name)
+    if name in _GENERATOR_NAMES:
+        from liteinfer.model.generator import ManualGenerator
+
+        return ManualGenerator
     raise AttributeError(f"module 'liteinfer' has no attribute {name!r}")
