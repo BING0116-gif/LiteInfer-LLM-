@@ -27,6 +27,8 @@ __all__ = [
     "Request",
     "RequestStatus",
     "RequestRegistry",
+    "Scheduler",
+    "SchedulerConfig",
 ]
 
 _CONFIG_NAMES = {"EngineConfig", "parse_dtype", "default_hf_cache_dir"}
@@ -38,6 +40,7 @@ _ALIGNMENT_NAMES = {"alignment_tolerances"}
 _CACHE_NAMES = {"KVCacheConfig", "ContiguousKVCache"}
 _CACHED_GENERATOR_NAMES = {"CachedGenerator"}
 _ENGINE_NAMES = {"EngineCore", "Request", "RequestStatus", "RequestRegistry"}
+_SCHEDULER_NAMES = {"Scheduler", "SchedulerConfig"}
 
 
 def __getattr__(name: str):
@@ -86,5 +89,12 @@ def __getattr__(name: str):
             "Request": Request,
             "RequestStatus": RequestStatus,
             "RequestRegistry": RequestRegistry,
+        }[name]
+    if name in _SCHEDULER_NAMES:
+        from liteinfer.scheduler import Scheduler, SchedulerConfig
+
+        return {
+            "Scheduler": Scheduler,
+            "SchedulerConfig": SchedulerConfig,
         }[name]
     raise AttributeError(f"module 'liteinfer' has no attribute {name!r}")

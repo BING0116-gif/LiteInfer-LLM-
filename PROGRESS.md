@@ -12,7 +12,7 @@
 | 03 | Minimal Qwen Decoder | CPU（FP32 对齐） | ✅ 已完成 | |
 | 04 | Contiguous KV Cache | CPU | ✅ 已完成 | |
 | 05 | Request + Engine Core | CPU | ✅ 已完成 | |
-| 06 | Continuous Batching Scheduler | CPU | ⬜ 未开始 | |
+| 06 | Continuous Batching Scheduler | CPU | ✅ 已完成 | |
 | 07 | BlockPool + Paged KV | CPU | ⬜ 未开始 | |
 | 08 | ModelRunner 接入 Paged KV | CPU | ⬜ 未开始 | |
 | 09 | Async Engine + Streaming API | CPU | ⬜ 未开始 | |
@@ -373,6 +373,92 @@ python examples/engine_demo.py                   # 3 并发请求全部与 Cache
 - `EngineCore.step()` 已是「schedule 出本批活跃请求 + 逐个 execute」的形状，Task 06 把它内部的
   "全部 active 都步进"替换为 Scheduler 的准入决策即可，引擎主循环不动。
 - 每个 `RequestState` 已持有专属 `ContiguousKVCache`，Task 07 仅把该字段换成 paged block。
+
+---
+
+## Task 06：Continuous Batching Scheduler（2026-09-08）
+
+**新增文件**
+
+```text
+liteinfer/scheduler/__init__.py     # 导出 Scheduler / SchedulerConfig / ScheduledBatch / SchedulerRequestInfo
+liteinfer/scheduler/config.py       # SchedulerConfig（max_num_seqs / max_num_batched_tokens，frozen）
+liteinfer/scheduler/scheduler.py    # Scheduler：waiting/running 双队列 + FCFS 准入 + 双预算；ScheduledBatch/SchedulerRequestInfo
+tests/test_scheduler.py             # 纯调度单测（无模型）
+tests/test_engine_scheduler.py       # 引擎集成：fake 模型 16 请求动态批 + 真模型与 CachedGenerator 逐字一致
+examples/scheduler_demo.py          # 最小运行示例：seq budget 限制下逐步准入
+docs/design/scheduler.md            # 设计文档（9 项交付 + Alternative + Known Limitations）
+```
+
+**修改文件**
+
+```text
+liteinfer/config.py                 # EngineConfig 增加 scheduler: SchedulerConfig 字段（集中配置）
+liteinfer/engine/core.py            # submit 入 waiting 队列 + token budget fail-fast；step 委托 Scheduler.schedule；cancel 从调度器移除；新增 _snapshot()
+liteinfer/__init__.py               # 惰性导出 Scheduler / SchedulerConfig
+PROGRESS.md                         # 本记录 + 进度表 06 置 ✅
+```
+
+**关键接口签名**
+
+```python
+SchedulerConfig(max_num_seqs: int = 16, max_num_batched_tokens: int = 2048)  # frozen
+Scheduler(cfg: SchedulerConfig)
+Scheduler.enqueue(request_id)                       # 提交 -> waiting 队尾（FCFS）
+Scheduler.schedule(requests: dict[str, SchedulerRequestInfo]) -> ScheduledBatch
+Scheduler.remove(request_id)                        # 取消/回收 -> 从两队列移除
+Scheduler.num_waiting / .num_running               # 观测属性
+SchedulerRequestInfo(request_id, prompt_len, output_len, status)
+ScheduledBatch(prefill_ids, decode_ids)             # .all_ids = prefill + decode
+# EngineCore 变化：
+EngineCore.scheduler: Scheduler                     # 由 cfg.scheduler 构造
+EngineCore.submit(...) -> rid                       # 入队 waiting，不再立即"在飞"
+EngineCore.step() -> list[RequestStepResult]        # 只推进 Scheduler 放行的本批
+```
+
+**验收命令**（CPU 全绿）
+
+```bash
+set "HF_HOME=D:\LiteInfer\hf_cache"
+set PYTHONPATH=d:\LiteInfer
+pytest tests/test_scheduler.py -q                          # 纯调度单测全绿
+pytest tests/test_engine_scheduler.py -q -m "not model"    # fake 模型 16 请求动态批全绿
+pytest tests/test_no_hardcoded_cuda.py -q                  # 无裸 cuda 字面量
+pytest -m model -q                                        # 真模型：scheduler 下与 CachedGenerator 逐字一致
+pytest tests/test_engine.py -q                             # Task 05 不回归
+pytest -q                                                 # 全快测不回归
+python examples/scheduler_demo.py                         # 展示 seq budget 限制下的逐步准入
+```
+
+实测（Qwen2.5-0.5B, CPU FP32, fake 模型 16 请求 + 真模型逐字一致）：
+
+```text
+pytest 全快测: 104 passed, 30 deselected
+pytest -m model: 30 passed（含 Task 06 与 Task 01-05 不回归）
+scheduler_demo: running 恒 <=3（max_num_seqs=3），waiting 随 finished 释放 slot 而清空
+```
+
+**踩过的坑**
+
+- **循环导入**：scheduler.py 在模块顶层 `from liteinfer.engine.request import RequestStatus`
+  会触发 `engine/__init__` -> `core` -> `scheduler`（半初始化），ImportError。改为在
+  `schedule()` 内做局部 import；类型注解靠 `from __future__ import annotations` 惰性求值，
+  模块顶层无需真正导入 RequestStatus。
+- **快照状态一致性**：调度器只认 `SchedulerRequestInfo` 快照里的 status，不反向持有引擎状态；
+  submit 不立即"在飞"，而是进 waiting，由 schedule 决定何时准入——否则序列预算无法生效。
+- **token budget 只闸门 NEW prefill**：running 的 decode 请求每步必被调度（cost=1 必放得下），
+  预算主要用于限制单步能 prefill 多少 token，避免超长 prompt 占满整步饿死其它请求。
+- **fail-fast 而非静默饿死**：prompt 长度 > max_num_batched_tokens 时 submit 直接抛
+  ValueError，比排进队列永不准入更易排查。
+- **engine_demo 无需改动**：默认 SchedulerConfig 预算足够大，Task 05 行为不变（已验证不回归）。
+
+**下一阶段提示（Task 07）**
+
+- 每个 `RequestState.cache` 仍是 `ContiguousKVCache`；Task 07 仅把该字段换成 paged block
+  （KVBlock/BlockPool/BlockTable），`step` 循环与调度逻辑完全不动。
+- 终态请求已能从 running 集合释放 slot（调度层面）；真正的 block 级显存回收属 Task 07。
+- Scheduler 产出的 `ScheduledBatch` 已是「本步该跑哪些请求」的明确边界，Task 08 ModelRunner
+  把它合并为一次 batch 前向即可。
 
 ---
 

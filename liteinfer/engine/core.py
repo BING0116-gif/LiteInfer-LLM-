@@ -24,6 +24,11 @@ import torch
 from liteinfer.cache.contiguous import ContiguousKVCache, KVCacheConfig
 from liteinfer.config import EngineConfig
 from liteinfer.device import resolve_dtype
+from liteinfer.scheduler.config import SchedulerConfig
+from liteinfer.scheduler.scheduler import (
+    Scheduler,
+    SchedulerRequestInfo,
+)
 from liteinfer.engine.request import (
     Request,
     RequestOutput,
@@ -93,6 +98,9 @@ class EngineCore:
         self.registry = RequestRegistry()
         # 内部态表：request_id -> RequestState（含缓存/张量，不对外暴露）
         self._states: dict[str, RequestState] = {}
+        # Task 06：调度器持有 waiting/running 双队列与预算闸门，决定每步本批跑谁。
+        # 配置来自 EngineConfig.scheduler（集中管理），默认 SchedulerConfig()。
+        self.scheduler = Scheduler(cfg.scheduler if isinstance(cfg.scheduler, SchedulerConfig) else SchedulerConfig())
 
     @classmethod
     def from_config(cls, cfg: EngineConfig) -> "EngineCore":
@@ -135,6 +143,14 @@ class EngineCore:
         # 不需要再给它腾位置（与 CachedGenerator 口径一致）
         capacity = prompt_len + params.max_tokens
 
+        # Token budget 闸门：单步可调度 token 上限若连一个 prompt 都放不下，说明
+        # 配置过小（或 prompt 异常），fail fast 比静默饿死更易排查。
+        if prompt_len > self.scheduler.max_num_batched_tokens:
+            raise ValueError(
+                f"prompt 长度 {prompt_len} 超过 max_num_batched_tokens="
+                f"{self.scheduler.max_num_batched_tokens}，无法准入"
+            )
+
         cache = self.new_cache(capacity)
         request_id = uuid.uuid4().hex
 
@@ -160,6 +176,9 @@ class EngineCore:
         )
         self.registry.add(req)
         self._states[request_id] = st
+        # Task 06：提交即入 waiting 队尾（FCFS）。是否真正开始 prefill 由调度器在
+        # 后续 step 按序列/ token 预算准入决定，而非提交即"在飞"。
+        self.scheduler.enqueue(request_id)
         logger.debug("提交请求 %s: prompt_len=%d max_tokens=%d", request_id, prompt_len, params.max_tokens)
         return request_id
 
@@ -183,19 +202,44 @@ class EngineCore:
             if req.generated
             else ""
         )
+        # Task 06：从调度器队列彻底移除，避免后续 step 仍尝试推进一个已取消的请求
+        self.scheduler.remove(request_id)
         logger.debug("取消请求 %s", request_id)
 
     def active_requests(self) -> list[Request]:
         return self.registry.active()
 
-    # ---- 主循环：每个 step 推进所有在飞请求一个 token ----
+    # ---- 主循环：每个 step 由 Scheduler 准入出本批，逐个推进 ----
+
+    def _snapshot(self) -> dict[str, SchedulerRequestInfo]:
+        """构造调度快照：request_id -> 只读的 (prompt_len, output_len, status)。
+
+        调度器只依赖这份快照做决策，不反向持有引擎内部状态，保证二者解耦。
+        """
+        snap: dict[str, SchedulerRequestInfo] = {}
+        for rid, st in self._states.items():
+            req = st.request
+            snap[rid] = SchedulerRequestInfo(
+                request_id=rid,
+                prompt_len=req.prompt_tokens,
+                output_len=len(req.generated),
+                status=req.status,
+            )
+        return snap
 
     def step(self) -> list[RequestStepResult]:
-        """推进所有在飞请求各一个 token，返回逐步结果（供 Task 09 流式消费）。"""
+        """推进本步由 Scheduler 准入出的批次各一个 token，返回逐步结果（供 Task 09 流式消费）。
+
+        与 Task 05「所有 active 都步进」不同：本步只跑调度器放行的请求；waiting 中
+        尚未准入、或已终态的请求不会推进。调度的「准入 + 双预算闸门」逻辑全在
+        Scheduler.schedule 内，引擎主循环形状不变。
+        """
         results: list[RequestStepResult] = []
+        batch = self.scheduler.schedule(self._snapshot())
         # 用 list 快照：_advance 内部可能改变状态，但不在循环里增删表
-        for st in list(self._states.values()):
-            if st.request.status.is_terminal:
+        for rid in batch.all_ids:
+            st = self._states.get(rid)
+            if st is None or st.request.status.is_terminal:
                 continue
             results.append(self._advance(st))
         return results

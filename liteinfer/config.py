@@ -9,11 +9,13 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
 import torch
+
+from liteinfer.scheduler.config import SchedulerConfig
 
 # Windows 无开发者模式时 symlink 创建会静默失败，留下 0 字节的 snapshot 空壳
 # （blob 完整但 config.json 读不到）。设为 1 强制 huggingface_hub 用真实文件副本。
@@ -90,6 +92,8 @@ class EngineConfig:
     seed: int = 42
     trust_remote_code: bool = False
     local_files_only: bool = False
+    # Task 06 调度预算（sequence / token budget），集中到 EngineConfig 统一管理
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
 
     def resolved_hf_cache_dir(self) -> Path:
         return self.hf_cache_dir if self.hf_cache_dir else default_hf_cache_dir()
