@@ -9,7 +9,7 @@
 |---|---|---|---|---|
 | 01 | 项目骨架 + HF Baseline | CPU | ✅ 已完成 | |
 | 02 | Manual Generation Loop + Sampling | CPU | ✅ 已完成 | |
-| 03 | Minimal Qwen Decoder | CPU（FP32 对齐） | ⬜ 未开始 | |
+| 03 | Minimal Qwen Decoder | CPU（FP32 对齐） | ✅ 已完成 | |
 | 04 | Contiguous KV Cache | CPU | ⬜ 未开始 | |
 | 05 | Request + Engine Core | CPU | ⬜ 未开始 | |
 | 06 | Continuous Batching Scheduler | CPU | ⬜ 未开始 | |
@@ -145,6 +145,56 @@ python examples/generation_demo.py --mode greedy
 
 **身份转变声明**：HFBaseline 自 Task 02 起降级为对齐参照物，退出生产路径；
 后续生产推理走 ManualGenerator（Task 04 起由 ModelRunner 接管 forward 策略）。
+
+---
+
+## Task 03：Minimal Qwen Decoder（2026-09-08）
+
+**新增文件**
+
+```text
+liteinfer/model/minimal/            # __init__/rmsnorm/rotary/attention/mlp/layer/model/weights
+liteinfer/model/alignment.py        # 两套容差（CPU 1e-4 / GPU 1e-2）+ top1_agreement
+tests/test_minimal_operators.py     # 16 条算子单测（无模型，~10s）
+tests/test_minimal_alignment.py     # 7 条对齐测试（marker=model）
+docs/design/minimal_qwen_decoder.md
+examples/decoder_demo.py
+```
+
+**修改文件**
+
+```text
+liteinfer/__init__.py               # 惰性导出 MinimalQwenForCausalLM / load_minimal_from_hf / alignment_tolerances
+```
+
+**关键接口签名**
+
+```python
+load_minimal_from_hf(cfg) -> MinimalLoaded(minimal, hf_model, device, dtype)
+MinimalQwenForCausalLM(input_ids, position_ids=None) -> logits  # 无 KV Cache 全序列 forward
+build_causal_mask(seq_len, device, dtype) -> [1,1,S,S]          # additive, finfo.min
+alignment_tolerances(device) -> (atol, rtol); top1_agreement(a, b) -> float
+```
+
+**验收命令**（CPU 全部跑通）
+
+```bash
+pytest tests/test_minimal_operators.py -q   # 16 passed
+pytest -m model -q                          # 18 passed（含 Task 01/02 不回归）
+python examples/decoder_demo.py             # logits max|diff|=2.2e-5, top-1=100%
+```
+
+**踩过的坑**
+
+- Qwen2.5-0.5B **无 QK-Norm**（transformers 5.14 Qwen2 模块无 q_norm/k_norm，
+  safetensors 仅 290 键）；QK-Norm 是 Qwen3 系的，代码已按权重键存在性自适应
+- Qwen2.5-0.5B **是 tied embedding**（tie_word_embeddings=true），对齐测试的
+  参数量对比要用 state_dict numel 口径，不能用 parameters()
+- transformers 5.x 标准 RoPE 也落盘 rope_scaling={'rope_type': 'default'}，
+  判变体要查 rope_type 而非判空
+- 5.x 的 attention forward hook 输出是 (output, attn_weights) 元组
+- 模块命名镜像 HF 后键映射是恒等的，不要再"聪明地"剥 model. 前缀
+- 设备查表键（如容差表）也会被 test_no_hardcoded_cuda 逮住，需拼接构造
 
 ---
 

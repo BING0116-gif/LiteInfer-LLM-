@@ -17,12 +17,17 @@ __all__ = [
     "SamplingParams",
     "Sampler",
     "ManualGenerator",
+    "MinimalQwenForCausalLM",
+    "load_minimal_from_hf",
+    "alignment_tolerances",
 ]
 
 _CONFIG_NAMES = {"EngineConfig", "parse_dtype", "default_hf_cache_dir"}
 _DEVICE_NAMES = {"get_device", "resolve_dtype", "peak_memory_mb", "process_rss_mb"}
 _SAMPLING_NAMES = {"SamplingParams", "Sampler"}
 _GENERATOR_NAMES = {"ManualGenerator"}
+_MINIMAL_NAMES = {"MinimalQwenForCausalLM", "load_minimal_from_hf"}
+_ALIGNMENT_NAMES = {"alignment_tolerances"}
 
 
 def __getattr__(name: str):
@@ -42,4 +47,12 @@ def __getattr__(name: str):
         from liteinfer.model.generator import ManualGenerator
 
         return ManualGenerator
+    if name in _MINIMAL_NAMES:
+        from liteinfer.model import minimal as _minimal
+
+        return getattr(_minimal, name)
+    if name in _ALIGNMENT_NAMES:
+        from liteinfer.model import alignment as _alignment
+
+        return getattr(_alignment, name)
     raise AttributeError(f"module 'liteinfer' has no attribute {name!r}")
