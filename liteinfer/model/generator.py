@@ -20,6 +20,7 @@ from typing import Any, Optional
 import torch
 
 from liteinfer.config import EngineConfig
+from liteinfer.model.eos import resolve_eos_ids
 from liteinfer.model.loader import LoadedModel, load_model_and_tokenizer
 from liteinfer.sampling.params import SamplingParams
 from liteinfer.sampling.sampler import Sampler
@@ -64,21 +65,14 @@ class ManualGenerator:
         loaded: LoadedModel = load_model_and_tokenizer(cfg)
         return cls(loaded.model, loaded.tokenizer, cfg)
 
-    def _resolve_eos_ids(self) -> frozenset:
+    def _resolve_eos_ids(self) -> "frozenset[int]":
         """对齐 HF 的 EOS 语义：generation_config 优先于 tokenizer。
 
-        Qwen2.5 的生成终止符是 <|im_end|>（151645），记录在
-        generation_config.eos_token_id 而非 tokenizer.eos_token_id；
-        该字段可能是 int 也可能是 list，两种形态都要归一成集合。
+        解析逻辑抽到 ``liteinfer.model.eos``：Task 04 的 CachedGenerator
+        必须与之共用同一套终止符，否则两条链的"输出是否一致"会被 EOS
+        口径差异污染（详见 eos.py 的模块说明）。
         """
-        raw = getattr(self.model.generation_config, "eos_token_id", None)
-        if raw is None:
-            raw = self.tokenizer.eos_token_id
-        if raw is None:
-            return frozenset()
-        if isinstance(raw, int):
-            return frozenset({raw})
-        return frozenset(int(x) for x in raw)
+        return resolve_eos_ids(self.model, self.tokenizer)
 
     @property
     def device(self) -> torch.device:

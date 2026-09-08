@@ -12,23 +12,35 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from liteinfer.cache.contiguous import LayerKVCache
 from liteinfer.model.minimal.layer import QwenDecoderLayer
 from liteinfer.model.minimal.rmsnorm import RMSNorm
 
 
 def build_causal_mask(
-    seq_len: int, device: torch.device, dtype: torch.dtype
+    seq_len: int,
+    device: torch.device,
+    dtype: torch.dtype,
+    past_len: int = 0,
 ) -> torch.Tensor:
-    """构造 additive 因果 mask ``[1, 1, S, S]``。
+    """构造 additive 因果 mask ``[1, 1, S, S + past_len]``。
+
+    ``past_len`` 是已有历史的长度：第 i 个 query 的绝对位置是
+    ``past_len + i``，它能看到所有 ``key_pos <= query_pos`` 的 key。
+    用"位置比较"而不是"再拼一个 triu"来表达，是因为 decode / chunked
+    prefill 下 query 与 key 的长度不再相等，triu 的方阵语义会失效。
 
     用 ``finfo(dtype).min`` 而不是 ``-inf``：加法掩码里出现 -inf 与全屏蔽行
     相加会产生 NaN（softmax 的全 -inf 行），finfo.min 经 softmax 后约为 0
-    且数值稳定，这也是 HF 的做法。mask 只依赖 S/dtype/device，与 batch、
+    且数值稳定，这也是 HF 的做法。mask 只依赖 S/past/dtype/device，与 batch、
     head 无关，靠广播覆盖所有 head。
     """
-    mask = torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=device)
-    # 严格上三角（diagonal=1）保留对角线：token 看得见自己
-    mask = torch.triu(mask, diagonal=1)
+    total = seq_len + past_len
+    mask = torch.full((seq_len, total), torch.finfo(dtype).min, device=device, dtype=dtype)
+    if total > 0:
+        q_pos = torch.arange(past_len, total, device=device).unsqueeze(1)  # [S, 1]
+        k_pos = torch.arange(total, device=device).unsqueeze(0)  # [1, total]
+        mask.masked_fill_(k_pos <= q_pos, 0.0)
     return mask[None, None, :, :]
 
 
@@ -75,22 +87,48 @@ class MinimalQwenModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor | None = None,
+        kv_caches: list[LayerKVCache] | None = None,
+        write_pos: int = 0,
     ) -> torch.Tensor:
         """返回最后一层输出过 final norm 之后的 hidden states ``[B, S, H]``。
 
-        本阶段固定全序列 forward（无 KV Cache）；attention mask 在此统一
-        构造并传给每一层，层与层共享同一个 mask，避免重复分配。
+        Args:
+            input_ids: ``[B, S]``。
+            position_ids: ``[B, S]`` 绝对位置；None 时按
+                ``write_pos .. write_pos+S-1`` 生成（无缓存即 0..S-1）。
+            kv_caches: 逐层的 KV 缓冲区视图；None 表示不复用历史。
+            write_pos: 本次 token 在整条序列中的起始下标，既是缓存写入
+                位置，也是 mask 的 ``past_len``。
+
+        attention mask 在此统一构造并传给每一层，层与层共享同一个 mask，
+        避免重复分配。
         """
         batch, seq_len = input_ids.shape
         if position_ids is None:
-            # 单序列无 padding 时位置就是 0..S-1
-            position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
+            # 单序列无 padding 时位置就是 write_pos..write_pos+S-1；
+            # 带上 write_pos 偏移，chunked prefill 才能不吃掉历史位置
+            position_ids = torch.arange(
+                write_pos, write_pos + seq_len, device=input_ids.device
+            ).unsqueeze(0)
         hidden_states = self.embed_tokens(input_ids)
 
-        # dtype/device 跟随 embedding 输出：权重加载到哪，mask 就跟到哪
-        attention_mask = build_causal_mask(seq_len, hidden_states.device, hidden_states.dtype)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, position_ids, attention_mask)
+        if seq_len == 1:
+            # decode 的典型形态：单个 query 能看到全部历史 key，掩码全 0，
+            # 加它是纯浪费（scores 形状 [B, H, 1, T]，一次 O(T) 的加法）
+            attention_mask = None
+        else:
+            # dtype/device 跟随 embedding 输出：权重加载到哪，mask 就跟到哪
+            attention_mask = build_causal_mask(
+                seq_len, hidden_states.device, hidden_states.dtype, past_len=write_pos
+            )
+        for i, layer in enumerate(self.layers):
+            hidden_states = layer(
+                hidden_states,
+                position_ids,
+                attention_mask,
+                kv_caches[i] if kv_caches is not None else None,
+                write_pos,
+            )
         return self.norm(hidden_states)
 
 
@@ -115,9 +153,17 @@ class MinimalQwenForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor | None = None,
+        kv_caches: list[LayerKVCache] | None = None,
+        write_pos: int = 0,
     ) -> torch.Tensor:
-        """返回 ``[B, S, vocab]`` 的 logits（不做 softmax，与 HF 一致）。"""
-        hidden_states = self.model(input_ids, position_ids)
+        """返回 ``[B, S, vocab]`` 的 logits（不做 softmax，与 HF 一致）。
+
+        刻意**始终只返回 logits 张量**，不返回 ``past_key_values``：
+        历史 KV 已经由外部持有的缓存承载，再返回一份既多余又会把返回类型
+        变成 ``Tensor | tuple``，Task 03 那些 ``assert_close(mine, hf)`` 的
+        对齐断言就全得跟着改。
+        """
+        hidden_states = self.model(input_ids, position_ids, kv_caches, write_pos)
         return self.lm_head(hidden_states)
 
     @torch.no_grad()

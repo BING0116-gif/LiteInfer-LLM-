@@ -20,6 +20,9 @@ __all__ = [
     "MinimalQwenForCausalLM",
     "load_minimal_from_hf",
     "alignment_tolerances",
+    "KVCacheConfig",
+    "ContiguousKVCache",
+    "CachedGenerator",
 ]
 
 _CONFIG_NAMES = {"EngineConfig", "parse_dtype", "default_hf_cache_dir"}
@@ -28,6 +31,8 @@ _SAMPLING_NAMES = {"SamplingParams", "Sampler"}
 _GENERATOR_NAMES = {"ManualGenerator"}
 _MINIMAL_NAMES = {"MinimalQwenForCausalLM", "load_minimal_from_hf"}
 _ALIGNMENT_NAMES = {"alignment_tolerances"}
+_CACHE_NAMES = {"KVCacheConfig", "ContiguousKVCache"}
+_CACHED_GENERATOR_NAMES = {"CachedGenerator"}
 
 
 def __getattr__(name: str):
@@ -55,4 +60,12 @@ def __getattr__(name: str):
         from liteinfer.model import alignment as _alignment
 
         return getattr(_alignment, name)
+    if name in _CACHE_NAMES:
+        from liteinfer import cache as _cache
+
+        return getattr(_cache, name)
+    if name in _CACHED_GENERATOR_NAMES:
+        from liteinfer.model.cached_generator import CachedGenerator
+
+        return CachedGenerator
     raise AttributeError(f"module 'liteinfer' has no attribute {name!r}")

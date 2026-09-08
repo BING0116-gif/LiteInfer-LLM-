@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from liteinfer.cache.contiguous import LayerKVCache
 from liteinfer.model.minimal.attention import QwenSelfAttention
 from liteinfer.model.minimal.mlp import QwenMLP
 from liteinfer.model.minimal.rmsnorm import RMSNorm
@@ -52,10 +53,21 @@ class QwenDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        kv_cache: LayerKVCache | None = None,
+        write_pos: int = 0,
     ) -> torch.Tensor:
+        """``kv_cache`` / ``write_pos`` 原样透传给 attention。
+
+        层本身不感知缓存：MLP 是无状态的逐 token 计算，只有 attention 需要
+        历史。把参数放在这里（而不是让调用方直接摸 ``self_attn``）是为了
+        保持"一层 = 一次 black-box 前向"的接口，Task 03 的逐层对齐测试
+        依然可以用最朴素的方式调用。
+        """
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_ids, attention_mask)
+        hidden_states = self.self_attn(
+            hidden_states, position_ids, attention_mask, kv_cache, write_pos
+        )
         hidden_states = residual + hidden_states
 
         residual = hidden_states

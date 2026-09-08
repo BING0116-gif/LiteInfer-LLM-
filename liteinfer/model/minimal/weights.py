@@ -24,12 +24,18 @@ logger = logging.getLogger("liteinfer.model.minimal.weights")
 
 @dataclass
 class MinimalLoaded:
-    """MinimalQwen 及其对齐参照物的打包产物。"""
+    """MinimalQwen 及其对齐参照物的打包产物。
+
+    ``tokenizer`` 默认 None 是为了兼容 Task 03 的构造方式；Task 04 起
+    ``load_minimal_from_hf`` 会填上（底层 loader 本来就加载了它，不返回
+    等于逼调用方再下载/再解析一遍）。
+    """
 
     minimal: MinimalQwenForCausalLM
     hf_model: Any  # transformers 的 Qwen2ForCausalLM，作为对齐参照保留
     device: torch.device
     dtype: torch.dtype
+    tokenizer: Any = None
 
 
 def _minimal_from_hf_config(
@@ -120,4 +126,10 @@ def load_minimal_from_hf(cfg: EngineConfig) -> MinimalLoaded:
         "MinimalQwen 权重加载完成：%d 个张量, device=%s, dtype=%s",
         len(remapped), device, dtype,
     )
-    return MinimalLoaded(minimal=minimal, hf_model=hf_model, device=device, dtype=dtype)
+    return MinimalLoaded(
+        minimal=minimal,
+        hf_model=hf_model,
+        device=device,
+        dtype=dtype,
+        tokenizer=loaded.tokenizer,
+    )

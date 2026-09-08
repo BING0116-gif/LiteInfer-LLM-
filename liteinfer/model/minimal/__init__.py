@@ -5,8 +5,9 @@
 重映射只需剥离 ``model.`` 前缀，``load_state_dict(strict=True)`` 就能
 保证 checkpoint 里的每一个权重都被消费，杜绝"加载了但没用上"的静默错误。
 
-本阶段只做 forward（无 KV Cache、无采样），生产生成链仍是 Task 02 的
-ManualGenerator；Task 04 的 KV Cache 将复用这里的 attention/layer 结构。
+Task 03 只做 forward（无 KV Cache、无采样），生产生成链仍是 Task 02 的
+ManualGenerator；Task 04 的 KV Cache 已复用这里的 attention/layer 结构
+（forward 增加 kv_caches / write_pos 参数，默认 None 时行为不变）。
 """
 
 from liteinfer.model.minimal.model import (

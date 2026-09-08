@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from liteinfer.cache.contiguous import LayerKVCache
 from liteinfer.model.minimal.rotary import (
     RotaryEmbedding,
     apply_rotary_pos_emb,
@@ -90,17 +91,28 @@ class QwenSelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        kv_cache: LayerKVCache | None = None,
+        write_pos: int = 0,
     ) -> torch.Tensor:
         """单向推理前向。
 
         Args:
             hidden_states: ``[B, S, hidden]``，已经是 input_layernorm 之后的值。
-            position_ids: ``[B, S]``。
-            attention_mask: additive mask ``[B, 1, S, S]``（可屏蔽位置为
+            position_ids: ``[B, S]``。**必须是绝对位置**：decode 阶段单个
+                token 的位置是它在整条序列中的下标（= 已缓存长度），
+                RoPE 是绝对位置编码，从 0 开始会让续写内容全部错位。
+            attention_mask: additive mask ``[B, 1, S, S+past]``（可屏蔽位置为
                 finfo.min，其余 0）；None 表示不加 mask。
+            kv_cache: 该层对应的 KV 缓冲区视图；None 表示不复用历史
+                （Task 03 的全序列前向路径，行为与以前逐位一致）。
+            write_pos: 本次新算出的 token 写入缓存的起始下标。
 
         Returns:
             ``[B, S, hidden]`` 注意力输出（尚未加残差）。
+
+        缓存写入的位置刻意放在 **RoPE 之后**：缓存里存的是"旋转后的 K"，
+        与推理期语义一致，decode 时历史 K 无需再旋转一次；若存旋转前的 K，
+        每次 decode 都得把整段历史重算一遍，缓存就白做了。
         """
         batch, seq_len, _ = hidden_states.shape
 
@@ -127,6 +139,14 @@ class QwenSelfAttention(nn.Module):
 
         cos, sin = self.rotary_emb(position_ids)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        if kv_cache is not None:
+            # 缓存的物理布局是 [max_seq, KVH, D]，而此刻 k/v 是 [B, KVH, S, D]，
+            # 所以先 transpose 回 [B, S, KVH, D] 再写；append 返回的完整历史
+            # 视图同样 transpose 回来。两次 transpose 都只改步长不搬数据，
+            # 真正的数据搬运只有 append 内部那一次 O(n) 的 copy_（n=新 token 数）
+            k, v = kv_cache.append(k.transpose(1, 2), v.transpose(1, 2), write_pos)
+            k, v = k.transpose(1, 2), v.transpose(1, 2)
 
         # GQA 展开：KV 头数补齐到 Q 头数
         k = repeat_kv(k, self.num_kv_groups)
