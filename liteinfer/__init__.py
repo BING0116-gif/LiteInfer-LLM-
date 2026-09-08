@@ -32,6 +32,8 @@ __all__ = [
     "SchedulerConfig",
     "ModelRunner",
     "PagedLayerCache",
+    "AsyncEngine",
+    "StreamChunk",
 ]
 
 _CONFIG_NAMES = {"EngineConfig", "parse_dtype", "default_hf_cache_dir"}
@@ -45,6 +47,9 @@ _CACHED_GENERATOR_NAMES = {"CachedGenerator"}
 _ENGINE_NAMES = {"EngineCore", "Request", "RequestStatus", "RequestRegistry"}
 _SCHEDULER_NAMES = {"Scheduler", "SchedulerConfig"}
 _RUNNER_NAMES = {"ModelRunner", "PagedLayerCache"}
+# 注意：服务层（FastAPI）不走惰性导出——它要拉起 Web 栈，显式 `from liteinfer.server
+# import create_app` 才是预期用法，避免 import liteinfer 变慢。
+_ASYNC_NAMES = {"AsyncEngine", "StreamChunk"}
 
 
 def __getattr__(name: str):
@@ -107,5 +112,12 @@ def __getattr__(name: str):
         return {
             "ModelRunner": ModelRunner,
             "PagedLayerCache": PagedLayerCache,
+        }[name]
+    if name in _ASYNC_NAMES:
+        from liteinfer.engine.async_engine import AsyncEngine, StreamChunk
+
+        return {
+            "AsyncEngine": AsyncEngine,
+            "StreamChunk": StreamChunk,
         }[name]
     raise AttributeError(f"module 'liteinfer' has no attribute {name!r}")

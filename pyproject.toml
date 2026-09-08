@@ -19,6 +19,15 @@ dependencies = [
 dev = [
     "pytest>=8.0",
     "ruff>=0.4",
+    # Task 09 起：服务层与流式 API 的测试需要 Web 栈与 asyncio 测试插件
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "httpx>=0.27",
+    "pytest-asyncio>=0.23",
+]
+serving = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
 ]
 
 [tool.setuptools.packages.find]
@@ -32,3 +41,6 @@ markers = [
     "model: 需要下载/加载真实模型（慢，需要 hf_cache 就绪）",
     "slow: 长耗时测试",
 ]
+# Task 09：AsyncEngine 的测试是 async def，用 auto 模式省掉逐个加 marker 的噪音
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"

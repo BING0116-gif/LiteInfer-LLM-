@@ -15,7 +15,7 @@
 | 06 | Continuous Batching Scheduler | CPU | ✅ 已完成 | |
 | 07 | BlockPool + Paged KV | CPU | ✅ 已完成 | |
 | 08 | ModelRunner 接入 Paged KV | CPU | ✅ 已完成 | |
-| 09 | Async Engine + Streaming API | CPU | ⬜ 未开始 | |
+| 09 | Async Engine + Streaming API | CPU | ✅ 已完成 | |
 | 10 | Metrics + Tracing | CPU | ⬜ 未开始 | |
 | 11 | Prefix Cache | CPU | ⬜ 未开始 | |
 | 12 | Benchmark + Ablation | **云端 GPU** | ⬜ 未开始 | |
@@ -655,6 +655,124 @@ paged 与 contiguous 三请求文本 100% 逐字一致 -> OK
   （本 Task 已保证 cancel 会立刻归还物理块，docs/02 §10 的防泄漏要求已满足）。
 - 块池容量目前静态（`num_blocks` 构造时定死）；Task 09 做并发准入时若想按
   "剩余可用块数"做调度闸门，`BlockPool.num_free` 已经是可直接消费的观测项。
+
+---
+
+## Task 09：Async Engine + Streaming API（2026-09-08）
+
+**新增文件**
+
+```text
+liteinfer/engine/async_engine.py    # StreamChunk / AsyncStream / AsyncEngine（命令队列 + 后台循环 + 每请求输出队列）
+liteinfer/server/__init__.py        # 导出 create_app（刻意不进 liteinfer/__init__）
+liteinfer/server/schemas.py         # OpenAI 兼容 pydantic v2 模型
+liteinfer/server/sse.py             # SSE 帧编码/解析 + [DONE] + 禁用缓冲响应头
+liteinfer/server/app.py             # create_app：/v1/completions /v1/chat/completions /v1/models /health /cancel
+liteinfer/server/main.py            # uvicorn 启动入口（python -m liteinfer.server.main）
+tests/_fakes.py                     # 测试共用的"会写 KV"的假模型/假 tokenizer（跨文件共享）
+tests/test_async_engine.py          # 12 条快测 + 1 条 model
+tests/test_server_api.py            # 16 条快测（含真实 uvicorn 断连回收）
+examples/async_engine_demo.py       # asyncio 并发流式 + 取消 + 与 CachedGenerator 逐字对照
+examples/server_demo.py             # 起真服务 + OpenAI Python Client 调非流式/流式/chat/断连
+docs/design/async_serving.md        # 设计文档（9 项交付 + Alternative + Known Limitations）
+```
+
+**修改文件**
+
+```text
+liteinfer/engine/__init__.py        # 导出 AsyncEngine / StreamChunk
+liteinfer/__init__.py               # _ASYNC_NAMES 惰性导出 AsyncEngine / StreamChunk
+pyproject.toml                      # dev/serving 补 FastAPI 栈；asyncio_mode = "auto"
+PROGRESS.md                         # 本记录 + 进度表 09 置 ✅
+```
+
+**关键接口签名**
+
+```python
+StreamChunk(request_id, token_id, text, finished, finish_reason, index=0)   # text 是增量
+AsyncStream(engine, request_id)     # __aiter__ / aclose；关闭即触发 abort
+AsyncEngine(core)
+    .submit(prompt, params=None) -> str            # 投命令 + await future 拿 rid
+    .stream(request_id) -> AsyncStream
+    .generate(prompt, params=None) -> AsyncStream  # = submit + stream（返回流，不是 generator）
+    .abort(request_id)          # await 到取消生效（HTTP 取消端点）
+    .abort_nowait(request_id)   # 只投递命令（生成器清理路径）
+    .start() / .shutdown() / .is_running() / .pending_streams / .core
+create_app(engine=None, cfg=None, model_id=None) -> FastAPI   # 注入 engine 即可不加载模型
+# HTTP：
+#   GET  /health                        {status, model, device, dtype, waiting, running, kv_blocks_*}
+#   GET  /v1/models                     OpenAI ModelList
+#   POST /v1/completions                prompt: str | list[str]，stream -> SSE
+#   POST /v1/chat/completions           messages -> chat template（无模板则降级角色拼接）
+#   POST /v1/requests/{request_id}/cancel
+```
+
+**验收命令**（CPU 全绿）
+
+```bash
+set "HF_HOME=D:\LiteInfer\hf_cache"
+set PYTHONPATH=d:\LiteInfer
+python -m pytest tests/test_async_engine.py -q   # 12 passed
+python -m pytest tests/test_server_api.py -q     # 16 passed
+python -m pytest tests/test_no_hardcoded_cuda.py -q   # 1 passed
+python -m pytest -q                             # 161 passed, 35 deselected
+python -m pytest -m model -q tests/test_async_engine.py   # 1 passed（~50s）
+python examples/async_engine_demo.py --max-tokens 8
+python examples/server_demo.py --max-tokens 8
+```
+
+实测（Qwen2.5-0.5B, CPU FP32）：
+
+```text
+pytest -q:            161 passed, 35 deselected（Task 01-08 不回归，新增 28 条）
+async_engine_demo:    3 并发流式 identical=True；取消后 status=cancelled used_blocks=0
+server_demo:          OpenAI Client 非流式/流式/chat 全通；断连后 kv_blocks_used=0
+```
+
+**踩过的坑**
+
+- **流式丢最后一个 token（最隐蔽的一个）**：`EngineCore` 达到 `max_tokens` 时把"最后一个 token"
+  和 `finished=True` 合并在同一个 `RequestStepResult` 里；最初对 finished chunk 一律 `text=""`，
+  结果实测 `'345'` 而不是 `'3456'`。改为按 OpenAI 协议拆两帧：token 帧 + 只带 finish_reason 的
+  空帧；EOS 那步本身没有 token（`token_id is None`），单独走"只发终态帧"分支。
+- **httpx 的 `ASGITransport` 形不成"断连"**：实测第一条 SSE 帧到达时请求已经 `finished`
+  （它把应用跑到结束才返回），所以"读到一半断开"在 ASGI 直连下不可能发生。硬验收必须起
+  **真实 uvicorn + 真 socket**（`tests/test_server_api.py::test_client_disconnect_frees_blocks`）。
+- **TestClient 会把应用跑在另一个线程的事件循环里**，而 AsyncEngine 的队列/future 必须与引擎
+  循环同 loop；跨 loop 结算 future 会挂死。改用 `httpx.AsyncClient + ASGITransport` 手工跑
+  `app.router.lifespan_context(app)`，全在同一 loop 内。
+- **嵌套 async generator 的清理时机不确定**：外层（SSE）被关闭时，若内层流只靠 GC 兜底，
+  其 `finally` 由 `loop.call_soon_threadsafe` 调度，验证不了"断连一定回收"。改为显式
+  `it = engine.stream(rid).__aiter__()` + `finally: await it.aclose()`。
+- **清理路径不能 `await`**：`AsyncStream._iterate` 的 finally 若 await 一个"由引擎循环 resolve
+  的 future"，在生成器 finalizer/事件循环关闭时可能永远等不到。拆成 `abort()`（等生效）与
+  `abort_nowait()`（只投递），清理路径用后者。
+- **假 chat 测试的 tokenizer 陷阱**：FakeTokenizer 只能编码数字字符，若走 chat 降级拼接
+  `"user: 2\nassistant:"` 会 `int('u')` 崩溃。给它加 `apply_chat_template`（取最后一条 content），
+  降级分支另用 `object()` 当 tokenizer 单独覆盖。
+- **Windows GBK 控制台**：示例里的"对照"打印成乱码，改用 ASCII 标签 `[parity]`。
+- **`asyncio.Queue` 可在无 running loop 时构造**（3.10+ 已移除构造期的 loop 绑定），
+  因此 `AsyncEngine` 可以在同步 fixture 里创建，队列在第一次 `get()` 时绑定到使用它的 loop。
+
+**发现的环境问题（非 Task 09 引入，未擅自修改）**
+
+`pytest -m model -q`（35 条一次性跑）会在第 1~16 个测试后 `Windows fatal exception: access
+violation`，崩溃点 `transformers/core_model_loading.py::_materialize_copy`。**逐文件跑 8 个
+文件全部通过**（1+4+7+7+8+2+2+4 = 35 passed）。原因：每个测试模块都有 module 级 `loaded`
+fixture，FP32 的 0.5B（HF 模型 + MinimalQwen 副本）各约 2GB，本机 16.9GB 仅剩约 5GB 可用时
+连续多次加载会撑爆。建议：逐文件跑，或把 model fixture 改成 session 级只加载一次
+（涉及改动 Task 01-08 的既有测试文件，本次未动）。
+
+**下一阶段提示（Task 10）**
+
+- `AsyncEngine` 已把每一步的结果原样包成 `StreamChunk` 投递出来，`RequestStepResult` 里
+  `token_id/token_text/finished/finish_reason` 齐全，Task 10 的 TTFT/TPOT/ITL 只需在
+  `_dispatch` 前后打点（prefill 首 token 时间、相邻 token 间隔）。
+- `RequestState` 已有 `prefill_latency_s` / `decode_latency_s` / `cached_len` / `cache_bytes`，
+  `RequestOutput` 已透出后三者，KV utilization 的分母可用 `engine.core.runner.paged.num_blocks_*`。
+- `/health` 已暴露 `waiting` / `running` / `kv_blocks_used` / `kv_blocks_total`，
+  Prometheus 之类的采集口可以直接接这里。
+- 流式响应目前**不带 usage**（需要 `stream_options.include_usage`），Task 10 补指标时一起做。
 
 ---
 
