@@ -543,6 +543,7 @@ paged_kv_demo: [final] used=0 free=32  -> OK 零泄漏
   都走 `BlockTable.append`。
 - 物理布局 `[num_blocks, num_layers, block_size, KVH, D]` 已对齐 docs/02 §7，Task 08 无需改布局。
 - **禁止在 Task 07 内改 `attention.py` / `engine/core.py`**（用户明确不越界 Task 08）。
+- **Task 06 遗留的 set 顺序抖动**：`Scheduler._running` 原为 `set`，导致 running decode 请求输出顺序随 hash 随机；在你机器上触发 `test_running_decode_always_scheduled_under_budget` 失败（期望 `["a","b"]`，实际 `["b","a"]`）。已修复为 `dict[str, None]`（保留 insertion order + O(1) 成员判定），全量快测重新稳定通过。
 
 ---
 

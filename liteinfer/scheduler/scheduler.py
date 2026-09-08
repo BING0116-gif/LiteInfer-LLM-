@@ -75,7 +75,10 @@ class Scheduler:
     def __init__(self, cfg: SchedulerConfig) -> None:
         self._cfg = cfg
         self._waiting: deque[str] = deque()
-        self._running: set[str] = set()
+        # 用 dict 模拟「有序集合」：保留 set 的 O(1) 增删/成员判定，
+        # 同时保证按准入顺序迭代（FCFS 在 decode 输出上也应稳定）。
+        # Python 3.7+ dict 为 insertion-ordered，满足需求。
+        self._running: dict[str, None] = {}
 
     # ---- 对外查询（供测试 / Task 10 指标）----
 
@@ -105,7 +108,7 @@ class Scheduler:
         """请求被取消或外部回收时，从两个队列中彻底移除。"""
         if request_id in self._waiting:
             self._waiting.remove(request_id)
-        self._running.discard(request_id)
+        self._running.pop(request_id, None)
 
     # ---- 核心：每步调度 ----
 
@@ -121,8 +124,10 @@ class Scheduler:
         from liteinfer.engine.request import RequestStatus
 
         # 1. 清理 running 中的终态请求，释放并发 slot（连续批处理的关键：完成即让位）
+        #    用 dict comprehension 保留原准入顺序，避免 set 迭代顺序抖动导致 decode_ids 不稳定。
         self._running = {
-            rid for rid in self._running
+            rid: None
+            for rid in self._running
             if rid in requests and not requests[rid].status.is_terminal
         }
 
@@ -149,7 +154,7 @@ class Scheduler:
                 break
             used_tokens += cost
             self._waiting.popleft()
-            self._running.add(rid)
+            self._running[rid] = None
             prefill_ids.append(rid)
 
         return ScheduledBatch(prefill_ids=prefill_ids, decode_ids=decode_ids)
