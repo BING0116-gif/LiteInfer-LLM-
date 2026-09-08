@@ -13,7 +13,7 @@
 | 04 | Contiguous KV Cache | CPU | ✅ 已完成 | |
 | 05 | Request + Engine Core | CPU | ✅ 已完成 | |
 | 06 | Continuous Batching Scheduler | CPU | ✅ 已完成 | |
-| 07 | BlockPool + Paged KV | CPU | ⬜ 未开始 | |
+| 07 | BlockPool + Paged KV | CPU | ✅ 已完成 | |
 | 08 | ModelRunner 接入 Paged KV | CPU | ⬜ 未开始 | |
 | 09 | Async Engine + Streaming API | CPU | ⬜ 未开始 | |
 | 10 | Metrics + Tracing | CPU | ⬜ 未开始 | |
@@ -459,6 +459,90 @@ scheduler_demo: running 恒 <=3（max_num_seqs=3），waiting 随 finished 释�
 - 终态请求已能从 running 集合释放 slot（调度层面）；真正的 block 级显存回收属 Task 07。
 - Scheduler 产出的 `ScheduledBatch` 已是「本步该跑哪些请求」的明确边界，Task 08 ModelRunner
   把它合并为一次 batch 前向即可。
+
+---
+
+## Task 07：BlockPool + Paged KV（2026-09-08）
+
+**新增文件**
+
+```text
+liteinfer/cache/paged.py          # FreeQueue / BlockPool / KVBlock / BlockTable / PagedKVCache
+tests/test_paged_kv.py            # 16 条单测 + 10000 次无泄漏压测（无模型，~48s）
+examples/paged_kv_demo.py         # 多请求 append/读回/free 最小示例
+docs/design/paged_kv.md           # 设计文档（9 项交付 + Alternative + Known Limitations）
+```
+
+**修改文件**
+
+```text
+liteinfer/cache/__init__.py       # 导出 FreeQueue/BlockPool/KVBlock/BlockTable/PagedKVCache
+liteinfer/__init__.py             # _CACHE_NAMES 加入 PagedKVCache（惰性导出）
+```
+
+**关键接口签名**
+
+```python
+KVCacheConfig(...)                         # 复用 Task 04：num_layers/num_kv_heads/head_dim/dtype/device
+FreeQueue(total) / .pop() / .push(idx) / .size / .empty / .total
+BlockPool(cfg, block_size, num_blocks)
+    .alloc(n)->list[int]  .free(ids)  .num_total  .num_free  .num_used  .usage()  .nbytes
+KVBlock(pool, block_id)
+    .write_token(layer, offset, k_vec[KVH,D], v_vec)  .k_view(layer, offset)  .v_view(...)
+BlockTable(pool, block_size, blocks=[], num_tokens=0)
+    .append(tokens_k[Layers,n,KVH,D], tokens_v)->int(新分配块数)
+    .gather(layer, length)->[1, length, KVH, D]        # torch.gather 沿 block+offset 选槽
+    .free()  .num_tokens  .__len__
+PagedKVCache(cfg, block_size, num_blocks)
+    .new_block_table()->BlockTable  .append_tokens(table,k,v)->int
+    .free_table(table)  .num_blocks_total/free/used  .usage()  .nbytes
+```
+
+**验收命令**（CPU 全绿）
+
+```bash
+set "HF_HOME=D:\LiteInfer\hf_cache"
+set PYTHONPATH=d:\LiteInfer
+python -m pytest tests/test_paged_kv.py -q        # 16 passed（含 10000 次压测，~48s）
+python -m pytest tests/test_no_hardcoded_cuda.py -q  # 1 passed
+python -m pytest -q                               # 120 passed（Task 01-06 不回归，30 model deselected）
+python examples/paged_kv_demo.py                  # 多请求读回逐位一致，释放后 free==total（零泄漏）
+```
+
+实测：
+
+```text
+tests/test_paged_kv.py: 16 passed in 48.10s
+test_stress_10000_no_leak: 随机 10000 次建表→写随机长度→gather 逐位相等→释放，结束 num_free==total
+pytest -q: 120 passed, 30 deselected
+paged_kv_demo: [final] used=0 free=32  -> OK 零泄漏
+```
+
+**踩过的坑**
+
+- **`write_seq` shape 误用**：`append` 按 token 逐层写，单 token 单层 K/V 形状是 `[KVH, D]`
+  （不是 `[n, KVH, D]`），最初把 `tokens_k[layer, t]` 当 `[n, ...]` 传入导致 `n=KVH=2`、
+  偏移越界抛 ValueError；改为 `write_token(layer, offset, k_vec, v_vec)` 明确单 token 语义。
+- **gather 的 expand 维度**：`torch.gather(K_src, 0, idx_b)` 的输出样本维是 `length`，不是
+  `num_blocks`；`idx_b` 必须 `expand(length, block_size, KVH, D)` 而非 `expand_as(K_src)`，
+  否则在 dim0（10 vs 4）报 "expanded size must match"。输出形状 `[L, block_size, ...]` 才对。
+- **双重释放检测**：FreeQueue 用 `set` 做成员判定，`push` 时若下标已在空闲集合即抛 ValueError；
+  没有这层防护，double free 会虚高 free 计数、掩盖真实泄漏，压测会"假绿"。
+- **`expand` 非零维限制**：`sel_b.view(-1,1,1,1)` 只能把 dim0 外的维 expand 到目标大小，
+  dim0 必须等于 length，故 gather 输入 `idx_b` 形状固定为 `(L, bs, KVH, D)`。
+- **docstring 反斜杠转义警告**：`examples` 文档里的 `D:\LiteInfer\hf_cache` 触发
+  `SyntaxWarning: invalid escape sequence`，改用正斜杠 `D:/LiteInfer/hf_cache` 消除。
+
+**下一阶段提示（Task 08）**
+
+- 本 Task 已交付「缓存管理层 + gather 读接口」，`BlockTable.gather(layer, length)` 输出形状
+  `[1, length, KVH, D]` 与 Task 04 `LayerKVCache.read` 完全一致，Task 08 可直接替换。
+- Task 08 ModelRunner 的接入点：把 `RequestState.cache` 从 `ContiguousKVCache` 换成
+  `BlockTable`（或包一层 `PagedKVCache`），并在 `QwenSelfAttention.forward` 中用
+  `gather` 取到当前长度的 K/V 代替 `kv_cache.read`；prefill 一次写多 token、decode 每步写 1 token，
+  都走 `BlockTable.append`。
+- 物理布局 `[num_blocks, num_layers, block_size, KVH, D]` 已对齐 docs/02 §7，Task 08 无需改布局。
+- **禁止在 Task 07 内改 `attention.py` / `engine/core.py`**（用户明确不越界 Task 08）。
 
 ---
 
