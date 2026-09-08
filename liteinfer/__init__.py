@@ -23,6 +23,10 @@ __all__ = [
     "KVCacheConfig",
     "ContiguousKVCache",
     "CachedGenerator",
+    "EngineCore",
+    "Request",
+    "RequestStatus",
+    "RequestRegistry",
 ]
 
 _CONFIG_NAMES = {"EngineConfig", "parse_dtype", "default_hf_cache_dir"}
@@ -33,6 +37,7 @@ _MINIMAL_NAMES = {"MinimalQwenForCausalLM", "load_minimal_from_hf"}
 _ALIGNMENT_NAMES = {"alignment_tolerances"}
 _CACHE_NAMES = {"KVCacheConfig", "ContiguousKVCache"}
 _CACHED_GENERATOR_NAMES = {"CachedGenerator"}
+_ENGINE_NAMES = {"EngineCore", "Request", "RequestStatus", "RequestRegistry"}
 
 
 def __getattr__(name: str):
@@ -68,4 +73,18 @@ def __getattr__(name: str):
         from liteinfer.model.cached_generator import CachedGenerator
 
         return CachedGenerator
+    if name in _ENGINE_NAMES:
+        from liteinfer.engine import (
+            EngineCore,
+            Request,
+            RequestStatus,
+            RequestRegistry,
+        )
+
+        return {
+            "EngineCore": EngineCore,
+            "Request": Request,
+            "RequestStatus": RequestStatus,
+            "RequestRegistry": RequestRegistry,
+        }[name]
     raise AttributeError(f"module 'liteinfer' has no attribute {name!r}")

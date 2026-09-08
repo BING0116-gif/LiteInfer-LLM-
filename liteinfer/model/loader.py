@@ -65,12 +65,7 @@ def load_model_and_tokenizer(cfg: EngineConfig) -> LoadedModel:
     logger.info("加载 %s -> device=%s dtype=%s cache=%s",
                 cfg.model_id, device, dtype, cache_dir)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        cfg.model_id,
-        cache_dir=cache_dir,
-        local_files_only=cfg.local_files_only,
-        trust_remote_code=cfg.trust_remote_code,
-    )
+    tokenizer = _load_tokenizer(cfg, cache_dir)
     model = _from_pretrained(AutoModelForCausalLM, cfg, dtype, cache_dir)
     # 全仓库唯一的设备迁移入口：device 一定来自 EngineConfig，见补充条款 A1
     model.to(device)
@@ -83,3 +78,27 @@ def load_model_and_tokenizer(cfg: EngineConfig) -> LoadedModel:
         device=device,
         dtype=dtype,
     )
+
+
+def _load_tokenizer(cfg: EngineConfig, cache_dir: str) -> Any:
+    """加载 tokenizer，并在 fast 后端构建失败时回退到 slow（tiktoken 后端）。
+
+    原因：本机 transformers 5.14.1 + tokenizers 0.22.2 存在 Rust 后端构建 bug，
+    ``AutoTokenizer.from_pretrained`` 默认走 fast 会抛
+    ``Couldn't instantiate the backend tokenizer``。该 bug 会连带让仓库内**所有**
+    model 标记的测试无法加载模型。CPU 上 fast/slow tokenizer 的编码结果一致，
+    回退不影响正确性，只影响速度（tokenizer 不是推理热路径瓶颈）。
+    先试 fast、失败再回退：在正常的开发环境里仍优先用 fast。
+    """
+    common = dict(
+        cache_dir=cache_dir,
+        local_files_only=cfg.local_files_only,
+        trust_remote_code=cfg.trust_remote_code,
+    )
+    try:
+        return AutoTokenizer.from_pretrained(cfg.model_id, **common)
+    except Exception as exc:  # fast 后端构建失败（环境相关，非配置错误）
+        logger.warning(
+            "fast tokenizer 构建失败，回退 use_fast=False: %s", exc
+        )
+        return AutoTokenizer.from_pretrained(cfg.model_id, use_fast=False, **common)

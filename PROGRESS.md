@@ -11,7 +11,7 @@
 | 02 | Manual Generation Loop + Sampling | CPU | ✅ 已完成 | |
 | 03 | Minimal Qwen Decoder | CPU（FP32 对齐） | ✅ 已完成 | |
 | 04 | Contiguous KV Cache | CPU | ✅ 已完成 | |
-| 05 | Request + Engine Core | CPU | ⬜ 未开始 | |
+| 05 | Request + Engine Core | CPU | ✅ 已完成 | |
 | 06 | Continuous Batching Scheduler | CPU | ⬜ 未开始 | |
 | 07 | BlockPool + Paged KV | CPU | ⬜ 未开始 | |
 | 08 | ModelRunner 接入 Paged KV | CPU | ⬜ 未开始 | |
@@ -298,6 +298,81 @@ peak memory: N/A (no GPU)
 - 容量按 `prompt_len + max_tokens` 逐请求预分配 → 这是 contiguous 的内部/外部碎片来源，正是
   Task 07 分页与共享 block 的动机；decode 每步仍读全量历史 KV（O(T)），真实 PagedAttention 属 08。
 - 模型始终只返回 logits（不返回 past_key_values），Task 03 的 `assert_close(mine, hf)` 断言零改动全绿。
+
+---
+
+## Task 05：Request + Engine Core（2026-09-08）
+
+**新增文件**
+
+```text
+liteinfer/engine/__init__.py     # 导出 Request/RequestStatus/RequestRegistry/EngineCore 等
+liteinfer/engine/request.py      # Request / RequestStatus / RequestState / RequestRegistry / RequestOutput / RequestStepResult
+liteinfer/engine/core.py         # EngineCore：submit/step/run/cancel/get_request
+tests/test_engine.py             # 快测（request/registry + 假模型状态机）+ model 标记（与 CachedGenerator 逐字一致 + 多请求）
+examples/engine_demo.py          # 提交 3 个并发 prompt，run 并对照 CachedGenerator
+docs/design/engine_core.md       # 设计文档（9 项交付 + Alternative + Known Limitations）
+```
+
+**修改文件**
+
+```text
+liteinfer/__init__.py            # 惰性导出 EngineCore / Request / RequestStatus / RequestRegistry
+liteinfer/model/loader.py        # _load_tokenizer：fast 失败回退 use_fast=False（修复本机 transformers 5.14.1 tokenizers bug）
+PROGRESS.md                      # 本记录 + 进度表 05 置 ✅
+```
+
+**关键接口签名**
+
+```python
+Request(request_id, prompt, params, status=WAITING, prompt_tokens=0,
+        generated=[], finish_reason=None, output_text="")
+RequestStatus              # WAITING / PREFILL / DECODE / FINISHED / CANCELLED（str 枚举）
+RequestRegistry.add/get/remove/active()/count_by_status()
+EngineCore(model, tokenizer, cfg, eos_ids=None) / .from_config(cfg)
+EngineCore.submit(prompt, params=None) -> str            # request_id
+EngineCore.step() -> list[RequestStepResult]             # 所有在飞请求各推进一个 token
+EngineCore.run(max_steps=None) -> dict[str, RequestOutput]
+EngineCore.cancel(request_id) / .get_request(id) / .active_requests()
+RequestOutput(request_id, text, prompt_tokens, output_tokens, finish_reason,
+             latency_s, tokens_per_s, device, dtype,
+             prefill_latency_s, decode_latency_s, cached_tokens, cache_bytes)
+```
+
+**验收命令**（CPU 全绿）
+
+```bash
+set "HF_HOME=D:\LiteInfer\hf_cache"
+set PYTHONPATH=d:\LiteInfer
+pytest tests/test_engine.py -q -m "not model"   # 12 passed（无模型）
+pytest -m model -q                               # 含 Task 05 共 2 passed，且与 Task 01-04 不回归（28 passed）
+pytest -q                                       # 86 passed（全快测不回归）
+pytest tests/test_no_hardcoded_cuda.py -q        # 1 passed（无裸 cuda）
+python examples/engine_demo.py                   # 3 并发请求全部与 CachedGenerator 逐字一致
+```
+
+**踩过的坑**
+
+- 本机 `sentencepiece` 缺失 + `transformers 5.14.1 + tokenizers 0.22.2` 的 fast tokenizer
+  后端构建 bug（`Couldn't instantiate the backend tokenizer`），导致**仓库内所有 model 标记测试**
+  无法加载 tokenizer（连 Task 04 既有的 test_kv_generation 也一并挂掉）。两步修复：
+  (1) `pip install sentencepiece`；(2) `loader._load_tokenizer` 先试 fast、失败回退
+  `use_fast=False`（tiktoken 后端，CPU 上编码结果一致，仅速度略慢）。正常环境仍优先 fast。
+- `set HF_HOME=D:\LiteInfer\hf_cache` 不带引号会把尾随空格带进变量，缓存目录变
+  `hf_cache \hub` → 找不到本地权重/tokenizer，回退后去网络下载。务必 `set "HF_HOME=..."`（带引号）。
+- 编辑 `loader.py` 时曾把 `model = _from_pretrained(...)` 等几行误吞进 `_load_tokenizer`
+  函数体，导致 `load_model_and_tokenizer` 隐式返回 None → `loaded.model` 抛 AttributeError；
+  已把模型加载与 return 挪回原函数。教训：替换大段代码后务必读回确认函数边界。
+- 假模型必须按「输入 token 的纯函数」产出 next token，否则多请求共享单模型会串台；用
+  `nxt=(last+1)%vocab` 保证顺序无关、互不干扰，能真正验证并发维护。
+
+**下一阶段提示（Task 06）**
+
+- 本 Task 对多请求是「时间片交错」（每 step 推进所有在飞请求一个 token），不具备 waiting/running
+  队列、FCFS、token/sequence budget 准入与抢占——这些属 Task 06 Scheduler。
+- `EngineCore.step()` 已是「schedule 出本批活跃请求 + 逐个 execute」的形状，Task 06 把它内部的
+  "全部 active 都步进"替换为 Scheduler 的准入决策即可，引擎主循环不动。
+- 每个 `RequestState` 已持有专属 `ContiguousKVCache`，Task 07 仅把该字段换成 paged block。
 
 ---
 
