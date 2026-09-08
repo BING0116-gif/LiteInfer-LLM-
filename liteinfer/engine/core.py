@@ -8,8 +8,9 @@ budget）也尚未引入，本阶段对所有已 submit 的请求"全部同时�
 验收"可同时维护多个请求"的含义。
 
 与 Task 04 的关系：复用同一套「模型只返回 logits + 调用方持有 KV 缓存」
-的契约。每个请求持有一块专属 ``ContiguousKVCache``（Task 04 已把缓存生命
-周期外部化），Task 07 仅把这块缓存换成 paged block，本文件的 step 循环不动。
+的契约。Task 08 起每个请求不再预分配连续缓存，而是在首次 prefill 时从
+``ModelRunner`` 的共享块池领一张 ``BlockTable``，物理块按需 lazy 分配；
+请求进入终态或被取消时由本模块把块还回池里。step 循环的形状不变。
 """
 
 from __future__ import annotations
@@ -21,9 +22,9 @@ from typing import Any, Optional
 
 import torch
 
-from liteinfer.cache.contiguous import ContiguousKVCache, KVCacheConfig
 from liteinfer.config import EngineConfig
 from liteinfer.device import resolve_dtype
+from liteinfer.model.runner import ModelRunner, infer_kv_dims
 from liteinfer.scheduler.config import SchedulerConfig
 from liteinfer.scheduler.scheduler import (
     Scheduler,
@@ -45,22 +46,8 @@ from liteinfer.sampling.sampler import Sampler
 logger = logging.getLogger("liteinfer.engine.core")
 
 
-def _infer_kv_dims(model: Any) -> tuple:
-    """从模型读出缓存形状三元组 ``(num_layers, num_kv_heads, head_dim)``。
-
-    与 CachedGenerator 的 ``_model_kv_dims`` 同义，但更鲁棒：既支持
-    ``model.model.layers``（MinimalQwenForCausalLM 的真实结构），也支持测试用
-    的假模型把 layers 直接挂在顶层。按 KV 头数而非 Q 头数：GQA 下二者不等，
-    按 Q 头数存会把缓存放大 7 倍。
-    """
-    inner = getattr(model, "model", None)
-    layers = getattr(inner, "layers", None) or getattr(model, "layers", None)
-    if layers is None:
-        raise TypeError(
-            f"EngineCore 需要可推断 KV 维度的模型（有 model.layers 或 layers），收到 {type(model).__name__}"
-        )
-    attn = layers[0].self_attn
-    return len(layers), attn.num_kv_heads, attn.head_dim
+# KV 维度推断统一由 ModelRunner 提供（infer_kv_dims），此处不再保留第二份实现：
+# 缓存形状是"模型 + 配置"共同决定的，只有一份真相才能避免两处算出的块大小不一致。
 
 
 class EngineCore:
@@ -68,9 +55,13 @@ class EngineCore:
 
     职责边界（docs/07 §五：Scheduler/Cache/ModelRunner 解耦）：
     - 本类只做"请求状态机 + 调用模型"的总控，不实现调度策略（Task 06）、
-      不实现 batch 合并（Task 08）、不实现分页（Task 07）；
+      不直接操作物理块（Task 08 起由 ``ModelRunner`` 持有共享块池）；
     - 模型通过构造函数注入（与 CachedGenerator 同风格），便于测试用假模型替换；
     - 设备/dtype 全部取自 ``EngineConfig``，本模块不出现任何设备字面量。
+
+    Task 08 的变化：forward 不再直接调 ``self.model``，而是经 ``self.runner``
+    （prefill/decode），KV 落在共享的 PagedKVCache 里；请求进入终态 / 被取消时
+    由本类负责把块还回池里（docs/02 §2 生命周期的最后一步 "free KV blocks"）。
     """
 
     def __init__(
@@ -90,7 +81,9 @@ class EngineCore:
             if eos_ids is not None
             else resolve_eos_ids(model, tokenizer)
         )
-        self._kv_dims = _infer_kv_dims(model)
+        # Task 08：ModelRunner 持有共享块池 + 执行 prefill/decode。
+        # 引擎因此不再自己分配缓存，只在终态负责把块还回池里。
+        self.runner = ModelRunner(model, cfg)
         # 设备/dtype 一律从 EngineConfig 进入（补充条款 A1/A2），不依赖模型参数
         # 当前所在的设备——避免"模型忘了 .to(device)"这类隐患被悄悄吞掉
         self._device = torch.device(self.cfg.device)
@@ -109,19 +102,11 @@ class EngineCore:
         eos_ids = resolve_eos_ids(loaded.hf_model, loaded.tokenizer)
         return cls(loaded.minimal, loaded.tokenizer, cfg, eos_ids)
 
-    # ---- 缓存分配：与 CachedGenerator.new_cache 同形，按请求专属分配 ----
+    # ---- 块表：Task 08 起由 ModelRunner 的共享池按需分配，引擎不再预分配容量 ----
 
-    def new_cache(self, max_seq_len: int) -> ContiguousKVCache:
-        num_layers, num_kv_heads, head_dim = self._kv_dims
-        cache_cfg = KVCacheConfig(
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            max_seq_len=max_seq_len,
-            dtype=self._dtype,
-            device=self._device,
-        )
-        return ContiguousKVCache(cache_cfg)
+    def new_block_table(self):
+        """为请求开一张空块表（物理块在 prefill/decode 写入时按需分配）。"""
+        return self.runner.new_block_table()
 
     # ---- 请求接入 ----
 
@@ -139,9 +124,6 @@ class EngineCore:
         enc = self.tokenizer(prompt, return_tensors="pt")
         input_ids = enc["input_ids"].to(self._device)
         prompt_len = int(input_ids.shape[1])
-        # 容量 = prompt + max_tokens：最后一个 token 只需被 forward 一次就结束，
-        # 不需要再给它腾位置（与 CachedGenerator 口径一致）
-        capacity = prompt_len + params.max_tokens
 
         # Token budget 闸门：单步可调度 token 上限若连一个 prompt 都放不下，说明
         # 配置过小（或 prompt 异常），fail fast 比静默饿死更易排查。
@@ -151,7 +133,6 @@ class EngineCore:
                 f"{self.scheduler.max_num_batched_tokens}，无法准入"
             )
 
-        cache = self.new_cache(capacity)
         request_id = uuid.uuid4().hex
 
         generator: Optional[torch.Generator] = None
@@ -169,7 +150,9 @@ class EngineCore:
         )
         st = RequestState(
             request=req,
-            cache=cache,
+            # 块表留空，等真正被准入做 prefill 时才分配：waiting 队列里的请求
+            # 不该提前占住物理块（这正是分页相对 Task 04 预分配的价值）
+            cache=None,
             prompt_ids=input_ids,
             generator=generator,
             wall_start=time.perf_counter(),
@@ -204,6 +187,9 @@ class EngineCore:
         )
         # Task 06：从调度器队列彻底移除，避免后续 step 仍尝试推进一个已取消的请求
         self.scheduler.remove(request_id)
+        # Task 08：取消是 docs/02 §10 的显式路径，必须立刻归还物理块，
+        # 否则块会一直被"已取消但还占着块"的请求持有，直到进程退出
+        self._release(st)
         logger.debug("取消请求 %s", request_id)
 
     def active_requests(self) -> list[Request]:
@@ -279,11 +265,11 @@ class EngineCore:
         req = st.request
         req.status = RequestStatus.PREFILL
         t0 = time.perf_counter()
-        # 缓存已在 submit 时（inference_mode 外）分配；此处仅读取视图并写入
-        with torch.inference_mode():
-            logits = self.model(
-                st.prompt_ids, kv_caches=st.cache.layer_caches, write_pos=0
-            )
+        # 块表在被准入的这一刻才分配（waiting 期间不占物理块）；池在
+        # ModelRunner 构造时于 inference_mode 之外建好，此处只写入不新建张量
+        if st.cache is None:
+            st.cache = self.new_block_table()
+        logits = self.runner.prefill(st.prompt_ids, st.cache)
         st.prefill_latency_s += time.perf_counter() - t0
         st.cached_len = req.prompt_tokens
         candidate = self.sampler.sample(logits[0, -1], req.params, st.generator)
@@ -301,15 +287,8 @@ class EngineCore:
     def _decode(self, st: RequestState) -> RequestStepResult:
         req = st.request
         position = st.cached_len  # 绝对位置，RoPE 依赖它（Task 04 踩坑）
-        step_input = torch.tensor([[st.next_id]], device=self._device)
         t0 = time.perf_counter()
-        with torch.inference_mode():
-            logits = self.model(
-                step_input,
-                position_ids=torch.tensor([[position]], device=self._device),
-                kv_caches=st.cache.layer_caches,
-                write_pos=position,
-            )
+        logits = self.runner.decode(st.next_id, position, st.cache)
         st.decode_latency_s += time.perf_counter() - t0
         st.cached_len += 1
         candidate = self.sampler.sample(logits[0, -1], req.params, st.generator)
@@ -332,6 +311,19 @@ class EngineCore:
             return RequestStepResult(req.request_id, token_id, token_text, True, "length")
         return RequestStepResult(req.request_id, token_id, token_text, False, None)
 
+    def _release(self, st: RequestState) -> None:
+        """把请求的物理块还回共享池，并在还回去之前记下它占用的字节数。
+
+        顺序很重要：块 ``free`` 之后 ``BlockTable.num_tokens`` 归零，
+        字节数就再也问不出来了，而 ``RequestOutput.cache_bytes`` 要在请求
+        结束后仍可读（Task 10 指标会消费它），所以先记账再释放。
+        """
+        if st.cache is None:
+            return
+        st.cache_bytes = self.runner.bytes_for(st.cache)
+        self.runner.free_table(st.cache)
+        st.cache = None
+
     def _mark_finished(self, st: RequestState, reason: str) -> None:
         req = st.request
         req.status = RequestStatus.FINISHED
@@ -342,6 +334,8 @@ class EngineCore:
             if req.generated
             else ""
         )
+        # Task 08：终态即回收块（docs/02 §2 生命周期最后一步）
+        self._release(st)
 
     def _to_output(self, st: RequestState) -> RequestOutput:
         req = st.request
@@ -360,5 +354,5 @@ class EngineCore:
             prefill_latency_s=st.prefill_latency_s,
             decode_latency_s=st.decode_latency_s,
             cached_tokens=st.cached_len,
-            cache_bytes=st.cache.nbytes,
+            cache_bytes=st.cache_bytes,
         )

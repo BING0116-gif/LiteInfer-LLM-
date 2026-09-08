@@ -30,6 +30,8 @@ __all__ = [
     "RequestRegistry",
     "Scheduler",
     "SchedulerConfig",
+    "ModelRunner",
+    "PagedLayerCache",
 ]
 
 _CONFIG_NAMES = {"EngineConfig", "parse_dtype", "default_hf_cache_dir"}
@@ -42,6 +44,7 @@ _CACHE_NAMES = {"KVCacheConfig", "ContiguousKVCache", "PagedKVCache"}
 _CACHED_GENERATOR_NAMES = {"CachedGenerator"}
 _ENGINE_NAMES = {"EngineCore", "Request", "RequestStatus", "RequestRegistry"}
 _SCHEDULER_NAMES = {"Scheduler", "SchedulerConfig"}
+_RUNNER_NAMES = {"ModelRunner", "PagedLayerCache"}
 
 
 def __getattr__(name: str):
@@ -97,5 +100,12 @@ def __getattr__(name: str):
         return {
             "Scheduler": Scheduler,
             "SchedulerConfig": SchedulerConfig,
+        }[name]
+    if name in _RUNNER_NAMES:
+        from liteinfer.model.runner import ModelRunner, PagedLayerCache
+
+        return {
+            "ModelRunner": ModelRunner,
+            "PagedLayerCache": PagedLayerCache,
         }[name]
     raise AttributeError(f"module 'liteinfer' has no attribute {name!r}")

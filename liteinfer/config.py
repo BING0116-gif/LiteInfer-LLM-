@@ -94,6 +94,11 @@ class EngineConfig:
     local_files_only: bool = False
     # Task 06 调度预算（sequence / token budget），集中到 EngineConfig 统一管理
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
+    # Task 08 分页 KV：物理块大小（每个块容纳多少 token）与块池容量。
+    # num_blocks=None 时由 ModelRunner 按 scheduler.max_num_seqs 推导（够跑满并发即可），
+    # 显式给值则用于测试更小的池（验证块耗尽 fail fast）。
+    block_size: int = 16
+    num_blocks: Optional[int] = None
 
     def resolved_hf_cache_dir(self) -> Path:
         return self.hf_cache_dir if self.hf_cache_dir else default_hf_cache_dir()

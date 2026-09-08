@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 
-from liteinfer.cache.contiguous import LayerKVCache
 from liteinfer.model.minimal.attention import QwenSelfAttention
 from liteinfer.model.minimal.mlp import QwenMLP
 from liteinfer.model.minimal.rmsnorm import RMSNorm
+
+if TYPE_CHECKING:  # 仅类型检查期导入，见 attention.py 同款说明
+    from liteinfer.model.runner import KVCacheView
 
 
 class QwenDecoderLayer(nn.Module):
@@ -53,7 +57,7 @@ class QwenDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        kv_cache: LayerKVCache | None = None,
+        kv_cache: KVCacheView | None = None,
         write_pos: int = 0,
     ) -> torch.Tensor:
         """``kv_cache`` / ``write_pos`` 原样透传给 attention。

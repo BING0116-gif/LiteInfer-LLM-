@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from liteinfer.cache.contiguous import LayerKVCache
 from liteinfer.model.minimal.rotary import (
     RotaryEmbedding,
     apply_rotary_pos_emb,
 )
 from liteinfer.model.minimal.rmsnorm import RMSNorm
+
+if TYPE_CHECKING:  # 仅类型检查期导入：runner 与本模块互不依赖，避免包初始化顺序问题
+    from liteinfer.model.runner import KVCacheView
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -91,7 +95,7 @@ class QwenSelfAttention(nn.Module):
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-        kv_cache: LayerKVCache | None = None,
+        kv_cache: KVCacheView | None = None,
         write_pos: int = 0,
     ) -> torch.Tensor:
         """单向推理前向。
@@ -105,6 +109,8 @@ class QwenSelfAttention(nn.Module):
                 finfo.min，其余 0）；None 表示不加 mask。
             kv_cache: 该层对应的 KV 缓冲区视图；None 表示不复用历史
                 （Task 03 的全序列前向路径，行为与以前逐位一致）。
+                实现可以是 Task 04 的 ``LayerKVCache``（连续）或 Task 08 的
+                ``PagedLayerCache``（分页块表），二者接口同形，本方法无需区分。
             write_pos: 本次新算出的 token 写入缓存的起始下标。
 
         Returns:
@@ -141,10 +147,16 @@ class QwenSelfAttention(nn.Module):
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if kv_cache is not None:
-            # 缓存的物理布局是 [max_seq, KVH, D]，而此刻 k/v 是 [B, KVH, S, D]，
-            # 所以先 transpose 回 [B, S, KVH, D] 再写；append 返回的完整历史
-            # 视图同样 transpose 回来。两次 transpose 都只改步长不搬数据，
-            # 真正的数据搬运只有 append 内部那一次 O(n) 的 copy_（n=新 token 数）
+            # 追加式写入：只把本次新算出的 n 个 token 交给缓存，由它自己决定
+            # 落到哪里（连续实现是 [max_seq, KVH, D] 的 [start:start+n] 切片，
+            # 分页实现是 block table 的 (block, offset) 槽位），再把"完整历史"
+            # 读回来送进注意力。契约只有 append/read 两个方法，两种实现可互换。
+            #
+            # 缓存的物理布局是 [T, KVH, D]，而此刻 k/v 是 [B, KVH, S, D]，
+            # 所以先 transpose 回 [B, S, KVH, D] 再写；返回的完整历史
+            # 同样 transpose 回来。两次 transpose 都只改步长不搬数据。
+            # 注意：分页实现返回的不是视图而是 gather 出来的副本——这正是
+            # "零拷贝"让步给"可共享块"的地方（见 docs/design/paged_runner.md）。
             k, v = kv_cache.append(k.transpose(1, 2), v.transpose(1, 2), write_pos)
             k, v = k.transpose(1, 2), v.transpose(1, 2)
 

@@ -9,12 +9,16 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 from torch import nn
 
-from liteinfer.cache.contiguous import LayerKVCache
 from liteinfer.model.minimal.layer import QwenDecoderLayer
 from liteinfer.model.minimal.rmsnorm import RMSNorm
+
+if TYPE_CHECKING:  # 仅类型检查期导入，见 attention.py 同款说明
+    from liteinfer.model.runner import KVCacheView
 
 
 def build_causal_mask(
@@ -87,7 +91,7 @@ class MinimalQwenModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor | None = None,
-        kv_caches: list[LayerKVCache] | None = None,
+        kv_caches: list[KVCacheView] | None = None,
         write_pos: int = 0,
     ) -> torch.Tensor:
         """返回最后一层输出过 final norm 之后的 hidden states ``[B, S, H]``。
@@ -153,7 +157,7 @@ class MinimalQwenForCausalLM(nn.Module):
         self,
         input_ids: torch.Tensor,
         position_ids: torch.Tensor | None = None,
-        kv_caches: list[LayerKVCache] | None = None,
+        kv_caches: list[KVCacheView] | None = None,
         write_pos: int = 0,
     ) -> torch.Tensor:
         """返回 ``[B, S, vocab]`` 的 logits（不做 softmax，与 HF 一致）。

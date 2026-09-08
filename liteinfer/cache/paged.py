@@ -265,6 +265,34 @@ class BlockTable:
             self.num_tokens += 1
         return allocated
 
+    def write_token(
+        self,
+        layer: int,
+        offset: int,
+        k_vec: torch.Tensor,
+        v_vec: torch.Tensor,
+    ) -> None:
+        """把**单个 token、单层**的 K/V 写到绝对位置 ``offset``（Task 08 接入点）。
+
+        为什么需要它：``append`` 要求一次给出所有层（``[num_layers, n, KVH, D]``），
+        而模型的注意力是**逐层**前向的，第 i 层只能拿到自己那层的 K/V，凑不齐
+        ``num_layers`` 这一维。因此这里提供"单层单 token"粒度的写入。
+
+        块分配以 **token 绝对位置** 为唯一判据（``offset // block_size``），
+        所以同一 token 被多层各写一次时，只有第一层真正 ``alloc``，其余层复用
+        同一个物理块——分配次数与层数无关，与 Task 07 的 lazy allocation 语义一致。
+        """
+        if offset < 0:
+            raise ValueError(f"token 位置不能为负，收到 {offset}")
+        logical = offset // self.block_size
+        # while 而非 if：位置若跳变超过一整块（异常调用）也能补上，不会静默越界
+        while logical >= len(self.blocks):
+            (bid,) = self.pool.alloc(1)
+            self.blocks.append(KVBlock(self.pool, bid))
+        self.blocks[logical].write_token(layer, offset % self.block_size, k_vec, v_vec)
+        if offset + 1 > self.num_tokens:
+            self.num_tokens = offset + 1
+
     def gather(self, layer: int, length: int) -> torch.Tensor:
         """读回前 ``length`` 个 token 的 K（gather-based），返回 ``[1, length, KVH, D]``。
 
@@ -272,9 +300,21 @@ class BlockTable:
         维（选出块内偏移）取槽——这正是 PagedAttention 的 KV 读取逻辑，但落在
         CPU 的 ``torch.gather`` 上而非 CUDA kernel。Task 08 的 ModelRunner 直接复用。
         """
+        return self._gather(self.pool.k_blocks, layer, length)
+
+    def gather_v(self, layer: int, length: int) -> torch.Tensor:
+        """与 :meth:`gather` 同形，但读 V。
+
+        之所以单独一个方法而不是给 ``gather`` 加参数：Task 07 的 ``gather`` 签名
+        已被单测/压测钉死（读 K），新增兄弟方法比改签名更不容易引入回归。
+        """
+        return self._gather(self.pool.v_blocks, layer, length)
+
+    def _gather(self, blocks: torch.Tensor, layer: int, length: int) -> torch.Tensor:
+        """``gather``/``gather_v`` 的公共实现，``blocks`` 为池中的 K 或 V 张量。"""
         if length <= 0 or length > self.num_tokens:
             raise ValueError(f"gather 长度 {length} 超出 [1, {self.num_tokens}]")
-        K_src = self.pool.k_blocks[:, layer]  # [num_blocks, block_size, KVH, D]
+        K_src = blocks[:, layer]  # [num_blocks, block_size, KVH, D]
         block_size = self.block_size
         dev = K_src.device
         tok = torch.arange(length, device=dev)

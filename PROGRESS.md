@@ -14,7 +14,7 @@
 | 05 | Request + Engine Core | CPU | ✅ 已完成 | |
 | 06 | Continuous Batching Scheduler | CPU | ✅ 已完成 | |
 | 07 | BlockPool + Paged KV | CPU | ✅ 已完成 | |
-| 08 | ModelRunner 接入 Paged KV | CPU | ⬜ 未开始 | |
+| 08 | ModelRunner 接入 Paged KV | CPU | ✅ 已完成 | |
 | 09 | Async Engine + Streaming API | CPU | ⬜ 未开始 | |
 | 10 | Metrics + Tracing | CPU | ⬜ 未开始 | |
 | 11 | Prefix Cache | CPU | ⬜ 未开始 | |
@@ -544,6 +544,117 @@ paged_kv_demo: [final] used=0 free=32  -> OK 零泄漏
 - 物理布局 `[num_blocks, num_layers, block_size, KVH, D]` 已对齐 docs/02 §7，Task 08 无需改布局。
 - **禁止在 Task 07 内改 `attention.py` / `engine/core.py`**（用户明确不越界 Task 08）。
 - **Task 06 遗留的 set 顺序抖动**：`Scheduler._running` 原为 `set`，导致 running decode 请求输出顺序随 hash 随机；在你机器上触发 `test_running_decode_always_scheduled_under_budget` 失败（期望 `["a","b"]`，实际 `["b","a"]`）。已修复为 `dict[str, None]`（保留 insertion order + O(1) 成员判定），全量快测重新稳定通过。
+
+---
+
+## Task 08：ModelRunner 接入 Paged KV（2026-09-08）
+
+**新增文件**
+
+```text
+liteinfer/model/runner.py        # KVCacheView 协议 / PagedLayerCache 适配器 / ModelRunner / infer_kv_dims
+tests/test_paged_runner.py       # 13 条快测 + 4 条 model 标记
+examples/paged_runner_demo.py    # 多请求 + 块生命周期 + 与连续 KV 逐字对照
+docs/design/paged_runner.md      # 设计文档（9 项交付 + Alternative + Known Limitations）
+```
+
+**修改文件**
+
+```text
+liteinfer/cache/paged.py                    # +BlockTable.write_token / gather_v，内部抽出 _gather
+liteinfer/config.py                         # +block_size(16) / +num_blocks(None=按调度预算推导)
+liteinfer/engine/core.py                    # forward 改走 runner；块表 prefill 时惰性分配；终态/取消 _release 归还块
+liteinfer/engine/request.py                 # RequestState.cache -> BlockTable|None；+cache_bytes
+liteinfer/model/minimal/attention.py        # 仅类型标注：kv_cache 放宽为 KVCacheView（计算逻辑零改动）
+liteinfer/model/minimal/layer.py            # 同上
+liteinfer/model/minimal/model.py            # 同上（kv_caches: list[KVCacheView] | None）
+liteinfer/__init__.py                       # 惰性导出 ModelRunner / PagedLayerCache
+```
+
+**关键接口签名**
+
+```python
+KVCacheView(Protocol)                    # append(k[1,n,KVH,D], v, start) -> (k,v)[1,start+n,KVH,D]
+                                         # read(length) -> (k, v)[1,length,KVH,D]
+PagedLayerCache(table: BlockTable, layer_idx: int)   # 伪装成 LayerKVCache，鸭子类型替换
+BlockTable.write_token(layer, offset, k_vec[KVH,D], v_vec)   # 单 token 单层写，按需分块
+BlockTable.gather(layer, length) / .gather_v(...)    # -> [1, length, KVH, D]
+infer_kv_dims(model) -> (num_layers, num_kv_heads, head_dim)
+ModelRunner(model, cfg, block_size=None, num_blocks=None)
+    .paged: PagedKVCache            # 共享块池，构造时一次分配（inference_mode 之外）
+    .new_block_table() -> BlockTable
+    .prefill(input_ids, table) -> logits[1,P,V]
+    .decode(token_id, position, table) -> logits[1,1,V]   # position 即写入偏移（绝对位置）
+    .free_table(table) / .bytes_for(table) -> int
+    .block_size / .num_layers
+# EngineCore 变化：
+EngineCore.runner: ModelRunner
+EngineCore.new_block_table()      # 取代原 new_cache（不再预分配连续缓存）
+EngineCore._release(st)           # 先记账 cache_bytes 再 free_table，st.cache=None
+```
+
+**验收命令**（CPU 全绿）
+
+```bash
+set "HF_HOME=D:\LiteInfer\hf_cache"
+set PYTHONPATH=d:\LiteInfer
+python -m pytest tests/test_paged_runner.py -q -m "not model"   # 13 passed（~20s）
+python -m pytest tests/test_no_hardcoded_cuda.py -q             # 1 passed
+python -m pytest -q                                             # 133 passed（Task 01-07 不回归，34 deselected）
+python -m pytest -m model -q                                    # 34 passed（~313s）
+python examples/paged_runner_demo.py --max-tokens 8             # identical=True，used_blocks=0
+```
+
+实测（Qwen2.5-0.5B, CPU FP32）：
+
+```text
+block_size=16 num_blocks=18 pool=7.1 MB
+提交 3 个请求 -> waiting=3 used_blocks=0
+step 1 之后: running=2 used_blocks=2
+全部结束:   used_blocks=0 free_blocks=18
+paged 与 contiguous 三请求文本 100% 逐字一致 -> OK
+```
+
+**踩过的坑**
+
+- **`BlockTable.append` 与逐层前向的粒度冲突（本 Task 最大的坑）**：Task 07 的
+  `append` 要求一次给出所有层 `[num_layers, n, KVH, D]`，但注意力是**逐层**前向的，
+  第 i 层凑不齐 `num_layers` 这一维。解决办法是新增 `write_token(layer, offset, k, v)`
+  （单 token 单层），并把**块分配判据设为 token 绝对位置** `offset // block_size`——
+  于是同一 token 被 24 层各写一次时只有第一层真正 `alloc`，分配次数与层数无关
+  （`test_block_allocated_once_per_token_not_per_layer` 钉住：9 token/bs=4 → 3 块）。
+- **`gather` 只读 K**：Task 07 的 `gather` 硬编码读 `k_blocks`。V 需要独立方法，
+  于是抽出私有 `_gather(blocks, layer, length)`，让 `gather` / `gather_v` 共用，
+  既不动 Task 07 已压测的签名，又避免读 V 时误读成 K。
+- **释放之后就查不到字节数**：`_to_output` 原用 `st.cache.nbytes`。块 `free` 后
+  `num_tokens` 归零，字节数再也问不出来。改为 `_release` 里**先记账再释放**，
+  存进新增的 `RequestState.cache_bytes`（Task 10 的 KV utilization 会用）。
+- **dataclass 字段顺序**：想给 `RequestState.cache` 加默认值 None，但它前面的
+  `prompt_ids` 没有默认值 → "non-default argument follows default argument"。
+  不去重排字段（会破坏既有关键字调用），改为在 `submit` 里显式传 `cache=None`。
+- **类型标注的循环导入风险**：`attention.py` 若要运行时 `from liteinfer.model.runner
+  import KVCacheView`，会经过 `liteinfer.model` 包初始化，有环。用
+  `if TYPE_CHECKING:` + `from __future__ import annotations` 惰性求值绕开。
+- **假模型测不出分页**：Task 05/06 的 `FakeLM.forward` 直接忽略 `kv_caches`，
+  所以块分配/归零全是空跑（断言"释放后 used==0"在分配都没发生时也会假绿）。
+  新写了 `_WritingFakeLM`，forward 里显式 `for c in kv_caches: c.append(k, v, write_pos)`，
+  才真正覆盖写路径与块生命周期；并加
+  `test_blocks_actually_used_during_generation` 断言"过程中 used>0"，防止空跑通过。
+- **Windows cmd 没有 `tail`**：`pytest ... | tail -40` 直接报"不是内部或外部命令"，
+  改用不带管道的命令。
+- **别宣称性能收益**：gather 读是真实拷贝，比 Task 04 contiguous 的零拷贝视图更慢
+  （每 step 每层 K/V 各多一次 gather）。本阶段只验收正确性与块回收，
+  吞吐数字全部留给 Task 12 的 GPU benchmark。
+
+**下一阶段提示（Task 09）**
+
+- 引擎的 `step()` 已经返回 `list[RequestStepResult]`（含 `token_id` / `token_text` /
+  `finished`），正是 Task 09 流式输出的天然数据源，无需改引擎。
+- `EngineCore.run()` 是同步阻塞的；Task 09 的 AsyncEngine 需要把它拆成
+  "可被 asyncio 调度的 step"，并支持 client disconnect → `cancel(request_id)`
+  （本 Task 已保证 cancel 会立刻归还物理块，docs/02 §10 的防泄漏要求已满足）。
+- 块池容量目前静态（`num_blocks` 构造时定死）；Task 09 做并发准入时若想按
+  "剩余可用块数"做调度闸门，`BlockPool.num_free` 已经是可直接消费的观测项。
 
 ---
 

@@ -121,8 +121,10 @@ class RequestState:
     """
 
     request: Request
-    cache: Any  # ContiguousKVCache
-    prompt_ids: Any  # torch.Tensor [1, P]
+    # Task 08：分页 KV。首次 prefill 时才由 ModelRunner 分配（惰性），
+    # 终态/取消时由引擎 free_table 归还物理块并置回 None。
+    cache: Any = None  # BlockTable | None
+    prompt_ids: Any = None  # torch.Tensor [1, P]
     cached_len: int = 0
     next_id: int = 0
     generator: Any = None  # 可选 torch.Generator，greedy 时为 None
@@ -130,6 +132,9 @@ class RequestState:
     decode_latency_s: float = 0.0
     wall_start: float = 0.0
     wall_end: float = 0.0
+    # 释放块之前记录的"本请求实际占用 KV 字节数"：块还回去之后就查不到了，
+    # 而 RequestOutput.cache_bytes 需要在请求结束后仍能读
+    cache_bytes: int = 0
 
 
 class RequestRegistry:
