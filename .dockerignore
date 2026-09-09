@@ -1,0 +1,34 @@
+# 构建上下文黑名单：漏掉任意一条都可能把 GB 级缓存打进镜像
+
+# 虚拟环境与缓存（体积最大，必须排除）
+.venv/
+venv/
+hf_cache/
+pip_cache/
+
+# 临时与测试缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# 文档/进度（不属于运行镜像）
+docs/
+PROGRESS.md
+PROMPT.md
+
+# benchmark 产物允许进镜像（examples 需要 refer），只排除大文件
+benchmark/results/
+
+# VCS / IDE / 系统文件
+.git/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+*.log

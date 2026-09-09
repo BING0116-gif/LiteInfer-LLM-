@@ -1,0 +1,52 @@
+# LiteInfer 持续集成
+#
+# 设计原则：
+# - 默认门禁只跑【不依赖真实模型】的快速测试；模型测试（-m model）需要
+#   下载 Qwen2.5-0.5B（约 1GB），留给开发者本地验收，不进免费 runner。
+# - CPU wheel 单独先装（否则 pip 会从 PyPI 拉一个带 GPU 依赖的 torch）。
+# - 全量 ruff 不是门禁：仓库现有代码有 200+ style 级告警（历史债），
+#   强制通过会要求大面积无关重构；lint 只保证不新增裸设备字面量即可。
+# - docker-build 是手动触发的（workflow_dispatch）：镜像构建较慢，
+#   且本机 Docker 已可独立验证，CI 侧只做"换干净环境构建一次"的兜底。
+
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Fast tests (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install CPU torch
+        run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install project + dev deps
+        run: pip install -e ".[dev]"
+
+      - name: Full fast test suite (no model)
+        run: python -m pytest -q -m "not model"
+
+      - name: No hardcoded device literal (supplement A1)
+        run: python -m pytest tests/test_no_hardcoded_cuda.py -q
+
+  docker-build:
+    name: Docker image build (manual)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build CPU image
+        run: docker build -t liteinfer:ci .

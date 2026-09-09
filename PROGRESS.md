@@ -26,7 +26,7 @@
 
 - 开发机：**无 NVIDIA GPU**，Task 01–12 工具链必须在 CPU 上跑通；
   Task 12 全矩阵（5 引擎 × 4 workload × 6 并发）上云执行，CPU 用 smoke 口径验收
-- Python 3.13；PyTorch 装 CPU 版
+- Python 3.12.10（venv 在 `D:\LiteInfer\.venv`）；PyTorch 装 CPU 版（torch 2.14.0+cpu）
 - `HF_HOME=D:\LiteInfer\hf_cache`
 - 设备统一走 `EngineConfig.device`，禁止硬编码 `"cuda"`
 
@@ -1079,6 +1079,90 @@ prefix 命中 token 随并发增长（typical conc2/4 = 24/36）。全部 cell p
 - `results.csv` 列序是跨脚本契约（charts/report 消费），加列需同步三处，单测
   `test_csv_fieldnames_stable` 会兜底。
 - Task 13 Docker/CI 可直接把 `pytest` 与 `benchmark_demo --smoke` 当冒烟验收接进去。
+
+---
+
+## Task 13：Docker + CI + README（2026-09-09）
+
+**新增文件**
+
+```text
+Dockerfile                          # CPU 优先镜像（ARG TORCH_INDEX_URL 可切 GPU wheel）
+.dockerignore                       # 排除 .venv/hf_cache/pip_cache/docs/.git 等
+.github/workflows/ci.yml            # 质量门：pytest 快测 + A1 门禁；docker-build 手动触发
+docs/known_limitations.md           # 全部引用既有 docs/PROGRESS 的真实局限（不新编造）
+tests/test_deployment_assets.py     # 6 条部署资产约束测试 + 镜像上下文 skipif 守卫
+```
+
+**修改文件**
+
+```text
+README.md                  # 重写：定位/诚实声明/架构图/快速开始(venv+Docker)/Benchmark/局限/目录/文档索引
+PROGRESS.md                # 本记录 + 进度表 13 置 ✅ + 环境备忘改 Python 3.12.10（实测）
+```
+
+**关键资产要点**
+
+```dockerfile
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu   # GPU 构建: --build-arg 指 cu 版 index
+ENV HF_HOME=/model-cache                                    # 容器内缓存路径，运行时 -v 挂载本机 hf_cache
+RUN pip install torch --index-url "${TORCH_INDEX_URL}"      # 必须先单独装，editable 才不会重新拉 GPU wheel
+CMD ["python", "-m", "liteinfer.server.main", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+```yaml
+# .github/workflows/ci.yml
+# push/PR → ubuntu-latest: 装 CPU torch → pip install -e ".[dev]" → pytest -q -m "not model" → test_no_hardcoded_cuda
+# docker-build job 仅 workflow_dispatch（镜像构建慢，本机 Docker 已可独立验证）
+```
+
+- `tests/test_deployment_assets.py`：Dockerfile 含 HF_HOME 且无设备字面量、.dockerignore 排除重路径、
+  CI 含 pytest+A1 门禁、README 含 docs/07 Task 13 必含章节、known_limitations.md 存在且含 PagedAttention 诚实声明。
+  镜像内在 module 级 skipif（部署资产按设计不进镜像，见踩坑 #4）。
+
+**验收命令**（全部真实执行过）
+
+```bash
+set "HF_HOME=D:\LiteInfer\hf_cache"; set PYTHONPATH=d:\LiteInfer （PowerShell 用 $env: 赋值）
+pytest -q                                   # 242 passed, 37 deselected（基线 236 + 新增 6）
+pytest tests/test_deployment_assets.py -q   # 6 passed
+docker build -t liteinfer:cpu .             # 构建成功（torch 2.14.0+cpu / transformers 5.16.1 / sentencepiece 0.2.2）
+docker run --rm liteinfer:cpu python -m pytest -q     # 236 passed, 6 skipped, 37 deselected
+docker run --rm -v D:/LiteInfer/hf_cache:/model-cache liteinfer:cpu python examples/async_engine_demo.py --max-tokens 8
+    # [final] 与 CachedGenerator 全部一致 + 取消后零泄漏: True -> OK
+docker run --rm liteinfer:cpu python -m liteinfer.server.main --help   # usage 正常
+```
+
+**踩过的坑**
+
+- **本机 venv 从未装过 dev extras**：`fastapi/matplotlib` 缺失 → pytest 收集 3 个文件直接
+  `ModuleNotFoundError`（Task 01-08 只需核心依赖，09-12 的 server/图表 测试在别处又复装过）。
+  不猜直接看 `pip list` 确诊，`pip install -e ".[dev]"` 后 242 全绿。教训：venv 变更后先
+  `pip list` 而不是盲跑测试。
+- **PShell 至今无 `&&`**（Task 12 已记录，又踩）：`set HF_HOME=... && pytest` 直接 ParseError；
+  统一用 `$env:HF_HOME=...; $env:PYTHONPATH=...; pytest` 的分行写法。
+- **PyYAML 1.1 把 CI 的 `on:` 解析成 bool True**：对 `sorted(d.keys())` 做混合类型排序崩
+  TypeError。GitHub 官方 Actions 接受裸 `on:`；本地验证脚本用对具体键访问即可，不要 sorted。
+- **部署资产测试在镜像内全部 FileNotFoundError**：`.dockerignore` 按设计排除 `.github/` 与
+  `docs/`，Dockerfile 本身也不 COPY 进 `/workspace`，镜像内当然没有这些文件。这不是 bug，
+  是测试上下文边界没划清。加 module 级 `pytestmark = pytest.mark.skipif(not Dockerfile.exists())`
+  守卫：仓库上下文真实断言、镜像上下文跳过，两种上下文各司其职。
+- **首次 docker build 极慢的根因是 torch CPU wheel 下载走 download-r2.pytorch.org 只有
+  ~150kB/s**（196MB 约 28 分钟）→ 一次构建后层缓存命中即秒级；所以 CI 的 docker job
+  设成 workflow_dispatch 手动触发，不消耗每次 push。
+- **torch 先装 + editable 后装的顺序是硬约束**：`pip install torch --index-url cpu` 之后再
+  `pip install -e ".[dev]"`，pip 识别 torch 已满足依赖（log 显示 Requirement already satisfied），
+  绝不会从默认 PyPI 回拉带 GPU 的 wheel。
+- **PowerShell 里 `docker ... --help` 显示 exit -1**：是 --help 的正常退出语义，别当成失败；
+  看的是 stdout usage，不是 exit code。
+
+**下一阶段提示（Task 14 接入知微）**
+
+- 部署面已就绪：LiteInfer 的 `/v1/chat/completions` 对外就是 OpenAI 兼容 base，知微的 LLM
+  Provider 从外部 API 指向 LiteInfer 即可，无需改端点协议。
+- `benchmark_demo --smoke` 与 `async_engine_demo` 在容器内已跑通：Task 14 验证真模型时
+  `docker run -v D:/LiteInfer/hf_cache:/model-cache liteinfer:cpu ...` 是现成的快速路径。
+- 服务默认 `--host 127.0.0.1`（容器内 CMD 已是 0.0.0.0）；知微同机接入可保持 0.0.0.0 或走端口映射。
 
 ---
 
