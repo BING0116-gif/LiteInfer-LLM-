@@ -18,13 +18,14 @@
 | 09 | Async Engine + Streaming API | CPU | ✅ 已完成 | |
 | 10 | Metrics + Tracing | CPU | ✅ 已完成 | |
 | 11 | Prefix Cache | CPU | ✅ 已完成 | |
-| 12 | Benchmark + Ablation | **云端 GPU** | ⬜ 未开始 | |
+| 12 | Benchmark + Ablation | **云端 GPU** | ✅ 已完成 | |
 | 13 | Docker + CI + README | CPU | ⬜ 未开始 | |
 | 14 | 接入知微 | CPU | ⬜ 未开始 | |
 
 ## 环境备忘
 
-- 开发机：**无 NVIDIA GPU**，所有 Task 01–11 必须在 CPU 上跑通
+- 开发机：**无 NVIDIA GPU**，Task 01–12 工具链必须在 CPU 上跑通；
+  Task 12 全矩阵（5 引擎 × 4 workload × 6 并发）上云执行，CPU 用 smoke 口径验收
 - Python 3.13；PyTorch 装 CPU 版
 - `HF_HOME=D:\LiteInfer\hf_cache`
 - 设备统一走 `EngineConfig.device`，禁止硬编码 `"cuda"`
@@ -989,6 +990,95 @@ hit=  0 | prefill= 1675.5 ms      hit= 32 | prefill=  877.5 ms
   `PrefixCache.stats()` 与 `/metrics` 的 `prefix_hit_tokens_total` 可直接写 CSV。
 - 共享前缀 workload（docs/07 Task 12 的 4 个 workload 之一）现成可用，
   demo 里的"串行同前缀 3 请求"形状可直接搬进 benchmark 脚本。
+
+---
+
+## Task 12：Benchmark + Ablation（2026-09-09）
+
+**新增文件**
+
+```text
+benchmark/__init__.py                # 声明为包，测试可 from benchmark.xxx import ...
+benchmark/liteinfer_benchmark.py     # 矩阵驱动器（measure-only）：workload 规格/提示词构造/5 驱动 cell/汇总/CSV+JSON
+benchmark/benchmark_charts.py        # -> charts/*.png（Agg；每图脚注附实验记录 docs/05 §8）
+benchmark/benchmark_report.py        # -> report.md（诚实声明 + 实验记录表 + 结果表 + 真实数据驱动的结论节）
+benchmark/run_full_matrix.sh         # 云端一键脚本：全 5 引擎 × 4 workload × 6 并发，一轮跑完并 commit
+tests/test_benchmark_matrix.py       # 19 条无模型快测
+examples/benchmark_demo.py           # CPU smoke 全链路示例（验收主体）
+docs/design/benchmark.md             # 设计文档（9 项交付 + Alternative + Known Limitations）
+```
+
+**修改文件**
+
+```text
+pyproject.toml                       # [dev] +matplotlib>=3.9（Task 12 图表硬依赖，本机已装）
+PROGRESS.md                          # 本记录 + 进度表 12 置 ✅
+```
+
+**关键接口签名**
+
+```python
+# benchmark/liteinfer_benchmark.py
+ENGINES = ("hf", "nokv", "kv", "batch", "prefix")          # 5 真实驱动覆盖 6 命名消融
+FULL_WORKLOADS / SMOKE_WORKLOADS                            # 4 个 workload × full/smoke 口径
+workload_spec(name, smoke) -> dict   # smoke 缩放保形（kind 不变、长度缩小）
+build_prompt_text(tokenizer, n_tokens, macro=_PROMPT_MACRO) -> str   # encode-重复-截断-decode
+build_sp_prompts(tokenizer, shared_len, tail_len, count, tail_suffix=..., macro=...) -> list[str]
+percentile(values, q) / mean_opt(values)                   # None 感知（N/A 优于 0）
+CellRow(engine, workload, concurrency, ...36 字段)         # .to_csv()/from_csv()；缺失列空串<->None
+run_cell(...) / run_matrix(args) -> (rows, env)            # env=实验记录（docs/05 §14）
+_engine_cfg(base, concurrency, prompt_len, max_tokens, enable_prefix_cache) -> EngineConfig
+main(argv) -> int  # 全矩阵：--workloads decode prefill typical sp --concurrency 1 2 4 8 16 32 \
+                  #          --engines hf nokv kv batch prefix [--device --dtype --smoke ...]
+render_charts(csv, env, outdir) -> list[Path]   # 指标×5 + sp_prefix_ttft 对比图
+build_report(csv, env, charts_dir, out) -> str  # markdown 报告
+```
+
+**验收命令**（CPU 全部跑通）
+
+```bash
+set "HF_HOME=D:/LiteInfer/hf_cache"
+set PYTHONPATH=d:/LiteInfer
+python -m pytest tests/test_benchmark_matrix.py -q      # 19 passed
+python -m pytest tests/test_no_hardcoded_cuda.py -q      # 1 passed（benchmark/ 无裸 cuda）
+python -m pytest -q                                     # 236 passed, 37 deselected
+python examples/benchmark_demo.py --smoke               # 测量+图表+报告全链路，产物落 benchmark/results/demo/
+```
+
+实测（Qwen2.5-0.5B, CPU FP32, smoke 36 cell 全数通过）：
+kv 稳态 ~2.6~3.2 tok/s；sp@conc=4 prefix TTFT p50 4642.9ms vs batch 11812.5ms（下降 60.7%）；
+prefix 命中 token 随并发增长（typical conc2/4 = 24/36）。全部 cell parity_ok=1（minimal 系
+逐字一致），batch 终态 used=0、prefix free+used==total（块账目平衡），显存列 N/A (no GPU)。
+
+**踩过的坑**
+
+- **消融映射（设计取舍，已获用户确认）**：continuous batching 与 paged KV 自
+  Task 06/08 合并进 EngineCore 一个驱动，仓库无两套独立历史实现可分别跑；采用
+  "一线驱动双测量轴"（吞吐=V2 效果、KV 利用率=V3 效果），报告显式声明而非重写旧逻辑。
+- **2048 长 prompt 的两个显式配置**：默认块池按 max_new_tokens+128 token 推导，
+  长 prompt 撞池抛错 → `_engine_cfg` 按 ceil((pl+ml)/bs)+4 每序列 × 并发显式传
+  num_blocks；默认 token budget 2048 会让 2048 prompt 的 submit ValueError →
+  budget=max(2048, pl+8)。这两处不显式配置会直接炸，是本 Task 集成的第一道坎。
+- **prefix cell 的缓存块统计要在 `del core` 之前读**：PrefixCache 挂在
+  ModelRunner 上，删了就读不到；prefix 终态 used≠0 是预期（缓存块占池），
+  泄漏契约改为验 `free+used==total`，只有 batch 才真正要求 used==0。
+- **报告模板把 `text += _insights(rows)` 误删过**：该语句被模板改写吞掉后结论节
+  静默消失，`test_report_insights_only_from_data` 当场逮到（缺少"数据不足"分支）。
+  教训：改完大段模板必须重跑对应单测，不能只看 diff。
+- **顺序驱动"并发"=排队逐个跑**：hf/nokv/kv 并发 N 是 N 个请求背靠背，吞吐天然
+  平坦；引擎驱动同时提交才能看出批处理收益——两口径都用 out_tokens/wall，
+  cell 间可比。HF 无拆段计时，其 TTFT/TPOT/ITL 为 N/A（"N/A 优于 0"延续）。
+- **PShell 无 `&&`**：`set PYTHONPATH=... && python ...` 直接 ParseError，须
+  `$env:PYTHONPATH='d:/LiteInfer'; python ...`；后台任务的 stdout 是块缓冲，
+  盯进度用 `Get-Process python` 的 CPU 而非日志。
+
+**下一阶段提示（Task 13）**
+
+- 全矩阵命令 = `benchmark/run_full_matrix.sh`（云端设 LITEINFER_DEVICE/LITEINFER_DTYPE），
+  产物先 commit 再 push（云端随时被回收）；本地跑完 demo 后可删 `benchmark/results/demo`。
+- `results.csv` 列序是跨脚本契约（charts/report 消费），加列需同步三处，单测
+  `test_csv_fieldnames_stable` 会兜底。
+- Task 13 Docker/CI 可直接把 `pytest` 与 `benchmark_demo --smoke` 当冒烟验收接进去。
 
 ---
 
