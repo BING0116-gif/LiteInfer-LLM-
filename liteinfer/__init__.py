@@ -23,6 +23,7 @@ __all__ = [
     "KVCacheConfig",
     "ContiguousKVCache",
     "PagedKVCache",
+    "PrefixCache",
     "CachedGenerator",
     "EngineCore",
     "Request",
@@ -45,7 +46,7 @@ _SAMPLING_NAMES = {"SamplingParams", "Sampler"}
 _GENERATOR_NAMES = {"ManualGenerator"}
 _MINIMAL_NAMES = {"MinimalQwenForCausalLM", "load_minimal_from_hf"}
 _ALIGNMENT_NAMES = {"alignment_tolerances"}
-_CACHE_NAMES = {"KVCacheConfig", "ContiguousKVCache", "PagedKVCache"}
+_CACHE_NAMES = {"KVCacheConfig", "ContiguousKVCache", "PagedKVCache", "PrefixCache"}
 _CACHED_GENERATOR_NAMES = {"CachedGenerator"}
 _ENGINE_NAMES = {"EngineCore", "Request", "RequestStatus", "RequestRegistry"}
 _SCHEDULER_NAMES = {"Scheduler", "SchedulerConfig"}

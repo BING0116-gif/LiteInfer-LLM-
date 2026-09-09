@@ -17,7 +17,7 @@
 | 08 | ModelRunner 接入 Paged KV | CPU | ✅ 已完成 | |
 | 09 | Async Engine + Streaming API | CPU | ✅ 已完成 | |
 | 10 | Metrics + Tracing | CPU | ✅ 已完成 | |
-| 11 | Prefix Cache | CPU | ⬜ 未开始 | |
+| 11 | Prefix Cache | CPU | ✅ 已完成 | |
 | 12 | Benchmark + Ablation | **云端 GPU** | ⬜ 未开始 | |
 | 13 | Docker + CI + README | CPU | ⬜ 未开始 | |
 | 14 | 接入知微 | CPU | ⬜ 未开始 | |
@@ -889,6 +889,106 @@ gpu_memory_mb = N/A (no GPU)；结束后 kv_blocks_used=0（utilization=0.0）
   （docs/02 §11）注意与 `_release` 的"先记账再释放"顺序共存。
 - `/metrics` 的 `kv_utilization` 分母是总物理块；prefix cache 会"故意占住"
   块，届时 utilization 语义需区分"占用（含缓存）"与"在飞请求持有"。
+
+---
+
+## Task 11：Prefix Cache（2026-09-09）
+
+**新增文件**
+
+```text
+liteinfer/cache/prefix.py          # block_hash（链式 blake2b）+ PrefixCache（哈希表/ref count/LRU 驱逐）
+tests/test_prefix_cache.py         # 24 快测 + 1 model（哈希/命中/ref/LRU/位级 gather/引擎集成/压测/真模型）
+examples/prefix_cache_demo.py      # 共享前缀 workload，开/关缓存对照
+docs/design/prefix_cache.md        # 设计文档（9 项交付 + Alternative + Known Limitations）
+```
+
+**修改文件**
+
+```text
+liteinfer/cache/paged.py              # BlockTable +prefix_cache 字段 / adopt() / 分配与释放改道（gather/write 零改动）
+liteinfer/cache/__init__.py           # 导出 PrefixCache / block_hash
+liteinfer/model/runner.py             # ModelRunner 持有 PrefixCache；prefill(+write_pos=0 向后兼容)
+liteinfer/config.py                   # EngineConfig +enable_prefix_cache(默认 False) + from_env(LITEINFER_PREFIX_CACHE)
+liteinfer/engine/request.py           # RequestState/RequestOutput +prefix_hit_tokens；RequestState +prompt_token_ids
+liteinfer/engine/core.py              # _prefill lookup/adopt/后缀 forward/register；_decode 块写满注册；_to_output/metrics_snapshot 透出
+liteinfer/observability/metrics.py    # RequestMetrics +prefix_hit_tokens；snapshot +prefix_cached_blocks/prefix_hit_tokens_total
+liteinfer/__init__.py                 # 惰性导出 PrefixCache
+```
+
+**关键接口签名**
+
+```python
+block_hash(parent: int, tokens: Sequence[int]) -> int   # h_i = blake2b(h_{i-1} + 块内 token ids)，无符号 64 位链
+PrefixCache(pool: BlockPool, block_size: int)
+    .lookup(token_ids) -> (list[block_id], hit_len)     # 收养：ref+1 并移出 LRU；prompt 恰好整块全中时放弃最后一块
+    .register(token_ids, table) -> int                  # 新注册块数；已存在哈希跳过（先到先得）
+    .release_block(block_id)                            # ref-1；归 0 进 LRU 不还池；未追踪块直接还池
+    .alloc_new() -> block_id                            # 池空 -> LRU 驱逐；无可驱逐 fail fast
+    .stats() -> dict                                    # lookups/hits/hit_tokens/evictions/cached/evictable
+BlockTable.adopt(block_ids, num_tokens)                 # 命中块插到 blocks 头部（仅限空表）
+BlockTable(..., prefix_cache=PrefixCache|None)          # 分配/释放改道由表内部消费，调用方无感
+ModelRunner.prefill(input_ids, table, write_pos=0)      # 命中时 write_pos=hit_len 只算后缀
+ModelRunner.prefix: PrefixCache | None                  # cfg.enable_prefix_cache 决定
+EngineConfig(enable_prefix_cache=False)                 # 默认关：不破坏"请求结束后块全回收"契约；ablation 现成对照组
+RequestOutput/RequestMetrics.prefix_hit_tokens: int     # 可观察 cache hit 的直接载体
+# /metrics 新键：prefix_cached_blocks（None=未开启）、prefix_hit_tokens_total
+```
+
+**验收命令**（CPU 全绿）
+
+```bash
+set "HF_HOME=D:\LiteInfer\hf_cache"
+set "PYTHONPATH=d:\LiteInfer"
+python -m pytest tests/test_prefix_cache.py -q -m "not model"   # 24 passed
+python -m pytest tests/test_no_hardcoded_cuda.py -q             # 1 passed
+python -m pytest -q                                             # 217 passed, 37 deselected（Task 01-10 不回归）
+python -m pytest -m model -q tests/test_prefix_cache.py         # 1 passed（真模型命中+逐字一致）
+python -m pytest -m model -q tests/test_paged_runner.py         # 4 passed（runner 改动回归）
+python examples/prefix_cache_demo.py --max-tokens 16
+```
+
+实测（Qwen2.5-0.5B, CPU FP32, block_size=16）：
+
+```text
+===== prefix OFF =====            ===== prefix ON  =====
+hit=  0 | prefill= 1593.7 ms      hit=  0 | prefill= 1600.3 ms   # 首个请求必全算
+hit=  0 | prefill= 1526.2 ms      hit= 32 | prefill=  829.5 ms   # 命中 2 块，~1.9x
+hit=  0 | prefill= 1675.5 ms      hit= 32 | prefill=  877.5 ms
+两组输出文本逐字一致；stats: hits=2/3, hit_tokens=64, evictions=0
+```
+
+**踩过的坑**
+
+- **blake2b 摘要是无符号 64 位**：`int.from_bytes(digest)` 的结果最大 2^64-1，
+  链式哈希第二层把父哈希 `struct.pack(">q", ...)`（有符号）直接溢出抛
+  struct.error——快测 10 条连带挂掉。改 `">Q"`。教训：自研哈希链先把
+  "任意层级"的边界值测一遍，别只测第一层。
+- **prompt 恰好 N 个完整块且全命中时必须放弃最后一块**（留 token 现算，
+  logits 只能由 forward 产出）。单块 prompt 因此命中恒为 0，首版两个测试
+  用 1 块 prompt 造"释放后再命中"的场景，直接踩中这条设计规则——测试
+  场景要用 ≥2 块的 prompt。
+- **注册时机必须"KV 已完整落块"**：prefill 后 candidate 的 KV 还没写
+  （下一步 decode 才写它）。若在 _after_emit 里按 prompt+generated 注册，
+  同批后 prefill 的请求会收养到"最后槽位是零"的半成品块。decode 的注册点
+  放在 forward 之后、`cached_len % block_size == 0` 时，用
+  `prompt_token_ids + generated`（此刻两者拼接恰好等于已写序列）。
+- **FakeLM 不读 KV，引擎级"输出一致"测不出收养块的内容错误**（FakeLM 的
+  logits 是输入 token 的纯函数，KV 内容是全零）。补了一条 cache 层位级
+  测试：收养 + 后缀续写后 gather 与"从零写一遍"逐位相等；真模型端到端
+  逐字一致做最终兜底。
+- **测试无法跨引擎命中**：PrefixCache 挂在 ModelRunner/PagedKVCache 实例上，
+  新建第二个 EngineCore 是全新缓存。所有"第二请求命中"的断言必须发生在
+  **同一个引擎**内（串行 run 两次，或同批 submit）。
+- **RequestOutput 没有 generated 字段**（那是 Request/内部态的）：观测断言用
+  `output_tokens` / `text`，或走 `core.get_request(rid).generated`。
+
+**下一阶段提示（Task 12）**
+
+- `enable_prefix_cache` 开关即 ablation 的 "paged vs paged+prefix" 对照组；
+  `PrefixCache.stats()` 与 `/metrics` 的 `prefix_hit_tokens_total` 可直接写 CSV。
+- 共享前缀 workload（docs/07 Task 12 的 4 个 workload 之一）现成可用，
+  demo 里的"串行同前缀 3 请求"形状可直接搬进 benchmark 脚本。
 
 ---
 

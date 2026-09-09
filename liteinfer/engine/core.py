@@ -159,6 +159,8 @@ class EngineCore:
             # 不该提前占住物理块（这正是分页相对 Task 04 预分配的价值）
             cache=None,
             prompt_ids=input_ids,
+            # Task 11：prompt 的 token id 列表，前缀哈希与 decode 期块注册共用
+            prompt_token_ids=[int(t) for t in input_ids[0].tolist()],
             generator=generator,
             wall_start=time.perf_counter(),
         )
@@ -196,6 +198,13 @@ class EngineCore:
             num_running=self.scheduler.num_running,
             kv_blocks_used=self.runner.paged.num_blocks_used,
             kv_blocks_total=self.runner.paged.num_blocks_total,
+            # Task 11：前缀缓存观测。关闭时为 None（键仍存在，值为 null），
+            # 与"显存指标无 GPU 时为 None 不填 0"同一口径
+            prefix_cached_blocks=(
+                self.runner.prefix.num_evictable_blocks
+                if self.runner.prefix is not None
+                else None
+            ),
         )
 
     def cancel(self, request_id: str) -> None:
@@ -300,11 +309,32 @@ class EngineCore:
         # ModelRunner 构造时于 inference_mode 之外建好，此处只写入不新建张量
         if st.cache is None:
             st.cache = self.new_block_table()
-        logits = self.runner.prefill(st.prompt_ids, st.cache)
+        # Task 11：前缀命中则收养已有物理块（引用计数在 lookup 内 +1），
+        # forward 只跑未命中的后缀——write_pos=hit_len 让 KV 从命中块末尾
+        # 续写，历史 KV 由收养的物理块直接提供（gather 读路径零改动）
+        prefix = self.runner.prefix
+        write_pos = 0
+        input_ids = st.prompt_ids
+        if prefix is not None:
+            hit_ids, hit_len = prefix.lookup(st.prompt_token_ids)
+            if hit_len > 0:
+                st.cache.adopt(hit_ids, hit_len)
+                st.prefix_hit_tokens = hit_len
+                input_ids = st.prompt_ids[:, hit_len:]
+                write_pos = hit_len
+                logger.debug(
+                    "请求 %s 前缀命中 %d tokens（%d 块）", req.request_id, hit_len, len(hit_ids)
+                )
+        logits = self.runner.prefill(input_ids, st.cache, write_pos=write_pos)
         t1 = time.perf_counter()
         st.prefill_latency_s += t1 - t0
         st.prefill_end_s = t1
         st.cached_len = req.prompt_tokens
+        # Task 11：把本次（新算出的）完整块注册进哈希表。已注册过的块
+        # （收养来的）会因哈希已存在而跳过；EOS 提前结束时 prompt 块也已
+        # 注册完毕，释放后留在 LRU 里等后续请求白捡
+        if prefix is not None:
+            prefix.register(st.prompt_token_ids, st.cache)
         candidate = self.sampler.sample(logits[0, -1], req.params, st.generator)
         req.status = RequestStatus.DECODE
 
@@ -324,6 +354,13 @@ class EngineCore:
         logits = self.runner.decode(st.next_id, position, st.cache)
         st.decode_latency_s += time.perf_counter() - t0
         st.cached_len += 1
+        # Task 11：本步写入后若恰好写满一个完整块，立即注册。必须放在
+        # forward 之后（KV 已完整落块）——若提前注册，同批后 prefill 的请求
+        # 可能收养到一个"最后槽位还是零"的半成品块。此刻 generated 里的
+        # token 都已落块（各自在之前的 step 写入），拼接即精确等于已写序列
+        prefix = self.runner.prefix
+        if prefix is not None and st.cached_len % self.runner.block_size == 0:
+            prefix.register(st.prompt_token_ids + req.generated, st.cache)
         candidate = self.sampler.sample(logits[0, -1], req.params, st.generator)
 
         if candidate in self._eos_ids:
@@ -397,4 +434,5 @@ class EngineCore:
             decode_latency_s=st.decode_latency_s,
             cached_tokens=st.cached_len,
             cache_bytes=st.cache_bytes,
+            prefix_hit_tokens=st.prefix_hit_tokens,
         )

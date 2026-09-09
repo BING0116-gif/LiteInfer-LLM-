@@ -117,6 +117,7 @@ def make_core(
     max_num_batched_tokens: int = 1024,
     block_size: int = 16,
     eos: frozenset[int] | set[int] | None = None,
+    enable_prefix_cache: bool = False,
 ) -> EngineCore:
     """用假模型拼一个真实的 ``EngineCore``（含 Scheduler + PagedKVCache）。"""
     cfg = EngineConfig(
@@ -124,6 +125,7 @@ def make_core(
         dtype=torch.float32,
         max_new_tokens=max_new_tokens,
         block_size=block_size,
+        enable_prefix_cache=enable_prefix_cache,
         scheduler=SchedulerConfig(
             max_num_seqs=max_num_seqs,
             max_num_batched_tokens=max_num_batched_tokens,

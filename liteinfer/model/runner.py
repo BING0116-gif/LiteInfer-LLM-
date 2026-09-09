@@ -28,6 +28,7 @@ import torch
 
 from liteinfer.cache.contiguous import KVCacheConfig
 from liteinfer.cache.paged import BlockTable, PagedKVCache
+from liteinfer.cache.prefix import PrefixCache
 from liteinfer.config import EngineConfig
 from liteinfer.device import resolve_dtype
 
@@ -195,16 +196,31 @@ class ModelRunner:
             device=self._device,
         )
         self.paged = PagedKVCache(self._cache_cfg, self.block_size, self.num_blocks)
+        # Task 11：前缀缓存挂在本层（Task 10 遗留提示预留的位置）——hash 表的
+        # 粒度是物理块，天然属于块池的管理方；默认关闭（EngineConfig 决定），
+        # 关闭时为 None，一切行为与 Task 08/09/10 完全一致。
+        self.prefix: Optional[PrefixCache] = (
+            PrefixCache(self.paged.pool, self.block_size)
+            if cfg.enable_prefix_cache
+            else None
+        )
         logger.debug(
-            "ModelRunner 就绪: layers=%d block_size=%d num_blocks=%d (%.2f MB)",
+            "ModelRunner 就绪: layers=%d block_size=%d num_blocks=%d (%.2f MB) prefix_cache=%s",
             self.num_layers, self.block_size, self.num_blocks, self.paged.nbytes / 1e6,
+            "on" if self.prefix is not None else "off",
         )
 
     # ---- block table 生命周期（引擎按请求调用） ----
 
     def new_block_table(self) -> BlockTable:
-        """为该请求开一张空块表（物理块在写入时按需 lazy 分配）。"""
-        return self.paged.new_block_table()
+        """为该请求开一张空块表（物理块在写入时按需 lazy 分配）。
+
+        启用前缀缓存时把 ``PrefixCache`` 挂到表上：分配/释放走引用计数改道
+        （BlockTable._alloc_one_block / free 内部消费），引擎侧无感。
+        """
+        table = self.paged.new_block_table()
+        table.prefix_cache = self.prefix
+        return table
 
     def free_table(self, table: Optional[BlockTable]) -> None:
         """归还该请求占用的全部物理块；None 表示尚未分配，直接忽略。"""
@@ -224,14 +240,18 @@ class ModelRunner:
 
     # ---- 前向 ----
 
-    def prefill(self, input_ids: torch.Tensor, table: BlockTable) -> torch.Tensor:
-        """处理整个 prompt，返回 logits ``[1, P, vocab]``。
+    def prefill(
+        self, input_ids: torch.Tensor, table: BlockTable, write_pos: int = 0
+    ) -> torch.Tensor:
+        """处理一段 prompt，返回 logits ``[1, P, vocab]``。
 
-        一次写 P 个 token 的 K/V（跨块自动分配），随后由调用方取 ``logits[0, -1]``。
+        Task 11 增 ``write_pos``（默认 0 保持向后兼容）：前缀命中时调用方
+        只喂后缀 token，``write_pos=hit_len`` 让 KV 从命中块的末尾续写，
+        历史 KV 由被收养的物理块直接提供，RoPE 的绝对位置语义不受影响。
         """
         with torch.inference_mode():
             return self.model(
-                input_ids, kv_caches=self._handles(table), write_pos=0
+                input_ids, kv_caches=self._handles(table), write_pos=write_pos
             )
 
     def decode(

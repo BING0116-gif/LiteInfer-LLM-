@@ -99,6 +99,11 @@ class EngineConfig:
     # 显式给值则用于测试更小的池（验证块耗尽 fail fast）。
     block_size: int = 16
     num_blocks: Optional[int] = None
+    # Task 11 前缀缓存开关。默认 False：开启后终态请求的完整块会"故意占住"
+    # 池等待复用（kv_blocks_used 不再归零），这会改变"请求结束后块全回收"
+    # 的既有语义与测试契约；关闭时引擎行为与 Task 08/09/10 完全一致，
+    # 也为 Task 12 的 ablation（paged vs paged+prefix）保留了现成对照组。
+    enable_prefix_cache: bool = False
 
     def resolved_hf_cache_dir(self) -> Path:
         return self.hf_cache_dir if self.hf_cache_dir else default_hf_cache_dir()
@@ -119,6 +124,11 @@ class EngineConfig:
             values["dtype"] = parse_dtype(os.environ["LITEINFER_DTYPE"])
         if os.environ.get("LITEINFER_MAX_NEW_TOKENS"):
             values["max_new_tokens"] = int(os.environ["LITEINFER_MAX_NEW_TOKENS"])
+        if os.environ.get("LITEINFER_PREFIX_CACHE"):
+            # Task 11：环境变量开关，与其它配置同风格；truthy 才开，默认关
+            values["enable_prefix_cache"] = os.environ[
+                "LITEINFER_PREFIX_CACHE"
+            ].strip().lower() in ("1", "true", "yes", "on")
         if os.environ.get("HF_HOME"):
             values["hf_cache_dir"] = Path(os.environ["HF_HOME"])
         values.update(overrides)

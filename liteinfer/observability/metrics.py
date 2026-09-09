@@ -101,6 +101,8 @@ class RequestMetrics:
     cache_bytes: int
     end_s: float
     token_times: tuple[float, ...] = ()
+    # Task 11：本请求经前缀缓存复用、免于重算的 token 数（0=未命中/未开启）
+    prefix_hit_tokens: int = 0
 
     @classmethod
     def from_state(cls, st: "RequestState") -> "RequestMetrics":
@@ -129,6 +131,7 @@ class RequestMetrics:
             cache_bytes=st.cache_bytes,
             end_s=st.wall_end,
             token_times=tuple(float(t) for t in st.token_times),
+            prefix_hit_tokens=st.prefix_hit_tokens,
         )
 
 
@@ -177,6 +180,7 @@ class MetricsRegistry:
         num_running: Optional[int] = None,
         kv_blocks_used: Optional[int] = None,
         kv_blocks_total: Optional[int] = None,
+        prefix_cached_blocks: Optional[int] = None,
         now: Optional[float] = None,
     ) -> dict[str, Any]:
         """输出 JSON 安全的全局快照。
@@ -221,6 +225,12 @@ class MetricsRegistry:
             "kv_blocks_used": kv_blocks_used,
             "kv_blocks_total": kv_blocks_total,
             "kv_utilization": kv_util,
+            # Task 11：前缀缓存观测。prefix_cached_blocks 为 None 表示未开启
+            # （语义：ref==0 等待复用/驱逐的缓存块数）；命中 token 数从注册表聚合
+            "prefix_cached_blocks": prefix_cached_blocks,
+            "prefix_hit_tokens_total": sum(
+                m.prefix_hit_tokens for m in self._by_id.values()
+            ),
             "output_tokens_total": total_tokens,
             "output_tokens_per_s": window_tokens / self.throughput_window_s,
             "throughput_window_s": self.throughput_window_s,

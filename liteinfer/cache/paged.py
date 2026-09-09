@@ -30,11 +30,14 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from liteinfer.cache.contiguous import KVCacheConfig
+
+if TYPE_CHECKING:  # 只作类型标注：prefix.py 反向 import 本模块，运行时不导入避免成环
+    from liteinfer.cache.prefix import PrefixCache
 
 logger = logging.getLogger("liteinfer.cache.paged")
 
@@ -226,6 +229,18 @@ class BlockTable:
     block_size: int
     blocks: list[KVBlock] = field(default_factory=list)
     num_tokens: int = 0
+    # Task 11：前缀缓存引用（None 表示未启用）。只用于两处"改道"：
+    # 分配新块时允许 LRU 驱逐缓存块救急（alloc_new），释放块时按引用计数
+    # 归还而非直接还池（release_block）。本表对 PrefixCache 鸭子类型引用，
+    # 不 import 其类型（见文件头部 TYPE_CHECKING 说明）。
+    prefix_cache: Optional["PrefixCache"] = None
+
+    def _alloc_one_block(self) -> KVBlock:
+        """取一个新物理块：有前缀缓存时走它（可驱逐缓存块救急），否则直取池。"""
+        if self.prefix_cache is not None:
+            return KVBlock(self.pool, self.prefix_cache.alloc_new())
+        (bid,) = self.pool.alloc(1)
+        return KVBlock(self.pool, bid)
 
     def append(
         self, tokens_k: torch.Tensor, tokens_v: torch.Tensor
@@ -253,8 +268,7 @@ class BlockTable:
         for t in range(n):
             if self.num_tokens % self.block_size == 0:
                 # 当前块已满（或还没有块），从池里取一个新物理块
-                (bid,) = self.pool.alloc(1)
-                self.blocks.append(KVBlock(self.pool, bid))
+                self.blocks.append(self._alloc_one_block())
                 allocated += 1
             logical = self.num_tokens
             block = self.blocks[logical // self.block_size]
@@ -287,8 +301,7 @@ class BlockTable:
         logical = offset // self.block_size
         # while 而非 if：位置若跳变超过一整块（异常调用）也能补上，不会静默越界
         while logical >= len(self.blocks):
-            (bid,) = self.pool.alloc(1)
-            self.blocks.append(KVBlock(self.pool, bid))
+            self.blocks.append(self._alloc_one_block())
         self.blocks[logical].write_token(layer, offset % self.block_size, k_vec, v_vec)
         if offset + 1 > self.num_tokens:
             self.num_tokens = offset + 1
@@ -340,9 +353,39 @@ class BlockTable:
         g2 = torch.gather(g1, 1, idx_o)
         return g2.squeeze(1).unsqueeze(0)  # [1, L, KVH, D]
 
+    def adopt(self, block_ids: list[int], num_tokens: int) -> None:
+        """把命中前缀的物理块"收养"进本表最前面（Task 11 接入点）。
+
+        命中块永远是前缀（链式哈希从第 0 块起匹配），因此插在 blocks 头部；
+        引用计数已由 ``PrefixCache.lookup`` 维护，这里只建立映射。此后
+        ``write_token`` 按绝对位置续写时，已有块不会被重新分配/覆盖，
+        后缀 token 自然落到新块上。
+
+        仅允许在空表上调用：prefill 是请求生命周期里唯一该发生 adopt 的时刻，
+        非空表 adopt 意味着调用方逻辑有错，直接抛错比静默错位好排查。
+        """
+        bs = self.block_size
+        if num_tokens % bs != 0 or num_tokens // bs != len(block_ids):
+            raise ValueError(
+                f"adopt 参数不一致：num_tokens={num_tokens}（block_size={bs}）"
+                f"应等于 {len(block_ids)} 个完整块"
+            )
+        if self.blocks or self.num_tokens:
+            raise ValueError("adopt 只能在空 BlockTable 上调用")
+        self.blocks = [KVBlock(self.pool, bid) for bid in block_ids]
+        self.num_tokens = num_tokens
+
     def free(self) -> None:
-        """归还本请求占用的所有物理块，并清空逻辑表。"""
-        if self.blocks:
+        """归还本请求占用的所有物理块，并清空逻辑表。
+
+        Task 11：挂了前缀缓存时逐块走 ``release_block``（被追踪块 ref-1、
+        归 0 进 LRU 等复用；未追踪块直接还池），保持 Task 07 的双重释放
+        防护语义不变。
+        """
+        if self.prefix_cache is not None:
+            for b in self.blocks:
+                self.prefix_cache.release_block(b.block_id)
+        elif self.blocks:
             self.pool.free([b.block_id for b in self.blocks])
         self.blocks = []
         self.num_tokens = 0

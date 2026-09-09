@@ -94,6 +94,8 @@ class RequestOutput:
     decode_latency_s: float = 0.0
     cached_tokens: int = 0
     cache_bytes: int = 0
+    # Task 11：本次请求通过前缀缓存复用、免于重算的 token 数（0=未命中/未开启）
+    prefix_hit_tokens: int = 0
 
 
 @dataclass
@@ -125,6 +127,10 @@ class RequestState:
     # 终态/取消时由引擎 free_table 归还物理块并置回 None。
     cache: Any = None  # BlockTable | None
     prompt_ids: Any = None  # torch.Tensor [1, P]
+    # Task 11：prompt 的 token id 列表（submit 时一次性转好）。前缀缓存的
+    # 块哈希按 token 内容计算，decode 期每个块边界都要用它拼完整序列，
+    # 每次从张量重转是浪费，也不该在热路径上做。
+    prompt_token_ids: list[int] = field(default_factory=list)
     cached_len: int = 0
     next_id: int = 0
     generator: Any = None  # 可选 torch.Generator，greedy 时为 None
@@ -135,6 +141,8 @@ class RequestState:
     # 释放块之前记录的"本请求实际占用 KV 字节数"：块还回去之后就查不到了，
     # 而 RequestOutput.cache_bytes 需要在请求结束后仍能读
     cache_bytes: int = 0
+    # Task 11：本请求通过前缀缓存复用的 token 数（prefill 时 lookup 决定）
+    prefix_hit_tokens: int = 0
     # ---- Task 10 打点（观测旁路的数据源）----
     # 打点刻意只存"时刻"，不做任何计算：指标/时间线由 liteinfer.observability
     # 从这些字段纯函数式还原，引擎热路径上只有一次 perf_counter + append。
