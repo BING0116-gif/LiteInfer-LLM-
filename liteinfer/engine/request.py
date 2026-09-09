@@ -135,6 +135,15 @@ class RequestState:
     # 释放块之前记录的"本请求实际占用 KV 字节数"：块还回去之后就查不到了，
     # 而 RequestOutput.cache_bytes 需要在请求结束后仍能读
     cache_bytes: int = 0
+    # ---- Task 10 打点（观测旁路的数据源）----
+    # 打点刻意只存"时刻"，不做任何计算：指标/时间线由 liteinfer.observability
+    # 从这些字段纯函数式还原，引擎热路径上只有一次 perf_counter + append。
+    # 0.0 表示"尚未发生"（perf_counter 的取值恒为正，可作为哨兵值）。
+    prefill_start_s: float = 0.0  # 被调度准入、prefill forward 开始的时刻
+    prefill_end_s: float = 0.0  # prefill forward 完成的时刻（不含采样）
+    # 每个 token 的产出时刻（perf_counter），与 Request.generated 按下标一一对应
+    # （同一处代码 _after_emit 里同步 append），是 TTFT/ITL/TPOT 的唯一真相
+    token_times: list[float] = field(default_factory=list)
 
 
 class RequestRegistry:

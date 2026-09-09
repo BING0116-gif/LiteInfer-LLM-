@@ -19,6 +19,16 @@ class ChatMessage(BaseModel):
     content: str = ""
 
 
+class StreamOptions(BaseModel):
+    """OpenAI ``stream_options``：目前只实现 ``include_usage``。
+
+    语义（对齐 OpenAI）：设为 true 时，SSE 在最后一个正常帧之后**追加**一帧
+    ``choices: []`` + ``usage``；未设置时流里不出现 usage 帧。
+    """
+
+    include_usage: bool = False
+
+
 class _GenerationParams(BaseModel):
     """completions 与 chat/completions 共用的采样参数。
 
@@ -33,6 +43,7 @@ class _GenerationParams(BaseModel):
     top_k: int = -1  # -1 表示关闭 top-k
     seed: Optional[int] = None
     stream: bool = False
+    stream_options: Optional[StreamOptions] = None
 
 
 class CompletionRequest(_GenerationParams):
@@ -61,14 +72,18 @@ class CompletionChoice(BaseModel):
 
 
 class CompletionResponse(BaseModel):
-    """非流式 ``/v1/completions`` 响应；流式时每个 SSE 帧也是这个形状（text 为增量）。"""
+    """非流式 ``/v1/completions`` 响应；流式时每个 SSE 帧也是这个形状（text 为增量）。
+
+    Task 10 起：``stream_options.include_usage`` 时，流末尾追加一帧
+    ``choices=[]`` + ``usage``（OpenAI 协议），故 usage 不再恒为 None。
+    """
 
     id: str
     object: str = "text_completion"
     created: int
     model: str
     choices: list[CompletionChoice]
-    usage: Optional[Usage] = None  # 流式帧里不带 usage
+    usage: Optional[Usage] = None  # 非流式：总是带；流式：仅 include_usage 的收尾帧带
 
 
 class ChatCompletionChoice(BaseModel):
@@ -105,6 +120,8 @@ class ChatCompletionChunk(BaseModel):
     created: int
     model: str
     choices: list[ChatCompletionStreamChoice]
+    # Task 10：include_usage 时流末尾的 usage 帧带它（choices 为空列表）
+    usage: Optional[Usage] = None
 
 
 class ModelCard(BaseModel):

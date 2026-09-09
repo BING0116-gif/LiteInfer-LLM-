@@ -16,7 +16,7 @@
 | 07 | BlockPool + Paged KV | CPU | ✅ 已完成 | |
 | 08 | ModelRunner 接入 Paged KV | CPU | ✅ 已完成 | |
 | 09 | Async Engine + Streaming API | CPU | ✅ 已完成 | |
-| 10 | Metrics + Tracing | CPU | ⬜ 未开始 | |
+| 10 | Metrics + Tracing | CPU | ✅ 已完成 | |
 | 11 | Prefix Cache | CPU | ⬜ 未开始 | |
 | 12 | Benchmark + Ablation | **云端 GPU** | ⬜ 未开始 | |
 | 13 | Docker + CI + README | CPU | ⬜ 未开始 | |
@@ -773,6 +773,122 @@ fixture，FP32 的 0.5B（HF 模型 + MinimalQwen 副本）各约 2GB，本机 1
 - `/health` 已暴露 `waiting` / `running` / `kv_blocks_used` / `kv_blocks_total`，
   Prometheus 之类的采集口可以直接接这里。
 - 流式响应目前**不带 usage**（需要 `stream_options.include_usage`），Task 10 补指标时一起做。
+
+---
+
+## Task 10：Metrics + Tracing（2026-09-09）
+
+**新增文件**
+
+```text
+liteinfer/observability/__init__.py   # 导出 RequestMetrics/MetricsRegistry/RequestTrace/build_trace 等
+liteinfer/observability/metrics.py    # 纯函数指标还原（TTFT/ITL/TPOT/分位数）+ RequestMetrics + MetricsRegistry
+liteinfer/observability/trace.py      # RequestTrace：由打点字段还原事件时间线（render ASCII / to_dict JSON）
+tests/test_metrics.py                 # 21 条快测（合成时间戳纯函数 + FakeLM 引擎集成）+ 1 条 model
+tests/test_server_metrics.py          # 11 条快测：/metrics、trace 端点、SSE include_usage
+examples/metrics_demo.py              # 单请求完整时间线 demo（验收主体）
+docs/design/metrics_tracing.md        # 设计文档（9 项交付 + Alternative + Known Limitations）
+```
+
+**修改文件**
+
+```text
+liteinfer/engine/request.py   # RequestState +prefill_start_s/+prefill_end_s/+token_times（打点字段）
+liteinfer/engine/core.py      # _prefill/_after_emit 打点；_release 汇入 MetricsRegistry；+trace_of/+metrics_snapshot
+liteinfer/server/schemas.py   # +StreamOptions(include_usage)；CompletionResponse/ChatCompletionChunk 的 usage 字段说明
+liteinfer/server/app.py       # +GET /metrics、+GET /v1/requests/{id}/trace；/health +kv_utilization；SSE usage 帧
+liteinfer/__init__.py         # 惰性导出 RequestMetrics / MetricsRegistry / RequestTrace
+PROGRESS.md                   # 本记录 + 进度表 10 置 ✅
+```
+
+**关键接口签名**
+
+```python
+RequestState 新字段: prefill_start_s / prefill_end_s (float, 0=未发生) ; token_times: list[float]  # 与 generated 下标对应
+ttft_of(wall_start, token_times) -> float      # 首 token - enqueue（含排队+prefill）
+inter_token_latencies(token_times) -> list[float]
+tpot_of(token_times) -> Optional[float]        # 单 token 请求为 None（不是 0）
+RequestMetrics.from_state(st) -> RequestMetrics  # 终态一次性汇总（frozen，含 itl p50/p95/max、e2e、tokens_per_s、cache_bytes、token_times）
+MetricsRegistry(throughput_window_s=10.0)
+    .record(m)                                  # 按 request_id 覆盖（幂等）
+    .get(rid) / .has(rid) / __len__
+    .snapshot(num_waiting=, num_running=, kv_blocks_used=, kv_blocks_total=, now=None) -> dict
+        # 含 kv_utilization、output_tokens_per_s(滚动窗口)、ttft/tpot 均值、
+        # gpu_memory_mb(None on CPU) + gpu_memory_mb_display("N/A (no GPU)")
+RequestTrace(events, ttft_s, tpot_s, e2e_s, ...).render() / .to_dict()
+build_trace(st) -> RequestTrace                # enqueue -> prefill_start -> prefill_end -> token×n -> finished/cancelled
+# EngineCore 变化：
+EngineCore.metrics: MetricsRegistry
+EngineCore.trace_of(request_id) -> RequestTrace      # 未知 id 抛 KeyError
+EngineCore.metrics_snapshot() -> dict                # 调度器/块池观测项 + 注册表聚合
+# Server 变化：
+GET /metrics                          # JSON 快照（非 Prometheus 文本格式，依赖零新增）
+GET /v1/requests/{request_id}/trace   # 404 if unknown；非终态也可查
+/health                               # +kv_utilization
+SSE: stream_options={"include_usage": true} 时流末尾追加 choices=[] + usage 一帧（Task 09 遗留补齐）
+```
+
+**验收命令**（CPU 全绿）
+
+```bash
+set "HF_HOME=D:\LiteInfer\hf_cache"
+set "PYTHONPATH=d:\LiteInfer"
+python -m pytest tests/test_metrics.py -q -m "not model"    # 21 passed
+python -m pytest tests/test_server_metrics.py -q            # 11 passed
+python -m pytest tests/test_no_hardcoded_cuda.py -q         # 1 passed
+python -m pytest -q                                         # 193 passed, 36 deselected（Task 01-09 不回归）
+python -m pytest -m model -q tests/test_metrics.py          # 1 passed（~39s）
+python examples/metrics_demo.py --max-tokens 16
+```
+
+实测（Qwen2.5-0.5B, CPU FP32, demo 输出节选）：
+
+```text
+TTFT=510.23ms  TPOT=358.48ms  ITL p50/p95/max=333.42/473.85/502.72ms  E2E=5.8876s
+tokens_per_s=2.72   prefill/decode=0.5047/5.3377s   kv bytes=516096
+trace: enqueue(+0.000) -> prefill_start(+0.000) -> prefill_end(+0.505) -> token×16 -> finished(+5.888)
+自洽验算: 0.510 + 0.358×15 = 5.88 ≈ E2E 5.888（尾巴=终态处理 ~0.1ms）
+gpu_memory_mb = N/A (no GPU)；结束后 kv_blocks_used=0（utilization=0.0）
+```
+
+**踩过的坑**
+
+- **MetricsRegistry 用 dict 而非 list 是必须的**：合成测试里两个 RequestState
+  共用了 request_id="r1"，record 静默覆盖导致 requests_total 断言 1 != 2；
+  dict 键覆盖语义顺带让 `_release` 的潜在重复触达天然幂等。
+- **SamplingParams 有构造期校验**（max_tokens>=1）：合成"0 个 token"的
+  waiting 请求时 `SamplingParams(max_tokens=0)` 直接抛 ValueError，测试要
+  用 `max(1, output_tokens)`，输出 0 个 token 靠 generated/token_times 空
+  列表表达，不靠 params。
+- **调度器 running 集合是惰性清理**（Task 06 既有行为）：请求终态后、
+  下一次 `schedule()` 之前 `num_running` 仍计入它——run() 刚结束时断言
+  `num_running==0` 会失败。非本 Task 范围，未擅自修改调度器；测试只断言
+  `num_waiting==0` 并注释原因（Known Limitations #1）。
+- **打点字段用 0.0 做"未发生"哨兵**：perf_counter 取值恒为正，0.0 可安全
+  作为哨兵；trace 构建时按 `> 0` 过滤未发生的事件（waiting 请求只有
+  enqueue 一条）。
+- **滚动窗口吞吐必须基于 token 级时间戳**：仅请求级 tokens_per_s 聚合值
+  算不出"最近 N 秒输出多少 token"；RequestMetrics 全量保留 token_times
+  （frozen tuple），snapshot 里逐 token 判窗口归属。分母恒为窗宽而非窗口
+  时长，保证与稳态值可比。`snapshot(now=...)` 参数化时钟，窗口测试才能
+  确定性（"旧 token 排除在窗外"不用 sleep 等真实时间流逝）。
+- **单 token 请求的 TPOT 必须是 None 不是 0**：与 OpenAI usage 语义对齐；
+  均值聚合（ttft_s_mean/tpot_s_mean）也要跳过无定义的请求，否则 0 会稀释
+  均值——"N/A 优于 0"的原则同样适用于延迟指标。
+- **取消路径也要记账**：waiting 中即被取消的请求（cache=None，`_release`
+  原本 early return）原本会漏出指标注册表；在 early-return 分支里也
+  record，失败路径的请求数才完整。
+
+**下一阶段提示（Task 11 Prefix Cache）**
+
+- 打点已就位：prefix cache 的命中效果可直接消费——`RequestState.cached_len`
+  + `RequestMetrics`/`RequestOutput.cached_tokens`（语义：KV 里已有的 token
+  数）；prefix cache 落地后 TTFT 的下降就是最直接的验收观测。
+- `BlockTable` 已有物理块句柄，hash 表（block hash -> block）可挂在
+  `PagedKVCache` 层；释放块时"不归还而是挂入 hash 表"的引用计数策略
+  （docs/02 §11）注意与 `_release` 的"先记账再释放"顺序共存。
+- `/metrics` 的 `kv_utilization` 分母是总物理块；prefix cache 会"故意占住"
+  块，届时 utilization 语义需区分"占用（含缓存）"与"在飞请求持有"。
 
 ---
 

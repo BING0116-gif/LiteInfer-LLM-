@@ -93,6 +93,7 @@ def _core_stats(engine: AsyncEngine) -> dict[str, Any]:
         "running": None,
         "kv_blocks_used": None,
         "kv_blocks_total": None,
+        "kv_utilization": None,
     }
     scheduler = getattr(core, "scheduler", None)
     if scheduler is not None:
@@ -102,7 +103,40 @@ def _core_stats(engine: AsyncEngine) -> dict[str, Any]:
     if paged is not None:
         stats["kv_blocks_used"] = paged.num_blocks_used
         stats["kv_blocks_total"] = paged.num_blocks_total
+        if paged.num_blocks_total > 0:
+            # Task 10：KV utilization = 已用物理块 / 总物理块（分母 0 时 None）
+            stats["kv_utilization"] = paged.num_blocks_used / paged.num_blocks_total
     return stats
+
+
+def _metrics_snapshot(engine: AsyncEngine) -> dict[str, Any]:
+    """``GET /metrics`` 的响应体：委托 core 的注册表（真相在 core，服务层只翻译）。"""
+    core = engine.core
+    getter = getattr(core, "metrics_snapshot", None)
+    if callable(getter):
+        return dict(getter())
+    # 兜底：注入的极简假引擎没有 metrics 时，退化为 /health 的观测项
+    return _core_stats(engine)
+
+
+def _usage_of(engine: AsyncEngine, request_id: str) -> Optional[Usage]:
+    """从引擎读终态请求的 token 计数（SSE include_usage 帧用）。
+
+    请求结束后 registry 仍保留其 Request（量级 = 进程生命期内的请求数，
+    开发/演示场景可接受），因此终态后仍能查到。查不到时返回 None：
+    usage 帧缺失好过编造 0（与显存指标的"N/A 优于 0"同一原则）。
+    """
+    registry = getattr(engine.core, "registry", None)
+    if registry is None or request_id not in registry:
+        return None
+    req = engine.core.get_request(request_id)
+    prompt_tokens = int(getattr(req, "prompt_tokens", 0) or 0)
+    completion_tokens = int(getattr(req, "output_tokens", 0) or 0)
+    return Usage(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=prompt_tokens + completion_tokens,
+    )
 
 
 def _render_chat_prompt(tokenizer: Any, messages: list[ChatMessage]) -> str:
@@ -167,7 +201,7 @@ async def _generate_full(
 
 
 async def _completion_sse(
-    engine: AsyncEngine, request_id: str, model_id: str
+    engine: AsyncEngine, request_id: str, model_id: str, include_usage: bool = False
 ) -> AsyncIterator[bytes]:
     """``/v1/completions`` 的 SSE 体。
 
@@ -178,12 +212,20 @@ async def _completion_sse(
     """
     created = _now()
     response_id = _new_id("cmpl")
-    def _frame(text: str, finish: Optional[str]) -> bytes:
+    def _frame(text: str, finish: Optional[str], usage: Optional[Usage] = None) -> bytes:
         payload = CompletionResponse(
             id=response_id,
             created=created,
             model=model_id,
             choices=[CompletionChoice(index=0, text=text, finish_reason=finish)],
+            usage=usage,
+        )
+        return sse_frame(payload.model_dump())
+
+    def _usage_frame(usage: Usage) -> bytes:
+        # OpenAI 协议：usage 帧的 choices 是空列表，只携带 usage
+        payload = CompletionResponse(
+            id=response_id, created=created, model=model_id, choices=[], usage=usage
         )
         return sse_frame(payload.model_dump())
 
@@ -202,19 +244,25 @@ async def _completion_sse(
                 # 早期版本直接把 finished chunk 的 text 清空，结果最后一个 token 被吞掉。
                 yield _frame("", chunk.finish_reason)
                 break
+        if include_usage:
+            usage = _usage_of(engine, request_id)
+            if usage is not None:
+                yield _usage_frame(usage)
         yield SSE_DONE
     finally:
         await iterator.aclose()
 
 
 async def _chat_sse(
-    engine: AsyncEngine, request_id: str, model_id: str
+    engine: AsyncEngine, request_id: str, model_id: str, include_usage: bool = False
 ) -> AsyncIterator[bytes]:
     """``/v1/chat/completions`` 的 SSE 体（首个帧带 ``role=assistant``）。"""
     created = _now()
     response_id = _new_id("chatcmpl")
 
-    def _chunk(role: Optional[str], content: str, finish: Optional[str]) -> bytes:
+    def _chunk(
+        role: Optional[str], content: str, finish: Optional[str], usage: Optional[Usage] = None
+    ) -> bytes:
         payload = ChatCompletionChunk(
             id=response_id,
             created=created,
@@ -226,6 +274,14 @@ async def _chat_sse(
                     finish_reason=finish,
                 )
             ],
+            usage=usage,
+        )
+        return sse_frame(payload.model_dump())
+
+    def _usage_frame(usage: Usage) -> bytes:
+        # OpenAI 协议：chat 流的 usage 帧同样是 choices=[] 只带 usage
+        payload = ChatCompletionChunk(
+            id=response_id, created=created, model=model_id, choices=[], usage=usage
         )
         return sse_frame(payload.model_dump())
 
@@ -242,6 +298,10 @@ async def _chat_sse(
                 # 与 /v1/completions 同理：token 送完之后再补一个只带 finish_reason 的空帧
                 yield _chunk(None, "", chunk.finish_reason)
                 break
+        if include_usage:
+            usage = _usage_of(engine, request_id)
+            if usage is not None:
+                yield _usage_frame(usage)
         yield SSE_DONE
     finally:
         await iterator.aclose()
@@ -302,6 +362,33 @@ def create_app(
             **_core_stats(active),
         }
 
+    @app.get("/metrics")
+    async def metrics(request: Request) -> dict:
+        """全局指标快照（JSON）。
+
+        刻意不引入 prometheus_client：本阶段只交付 JSON 观测口，
+        Prometheus 文本格式留给 Task 12/13 按采集器需要再加，不为一个
+        端点增加依赖。显存类指标在 CPU 下为 None（渲染 N/A，不填 0）。
+        """
+        return _metrics_snapshot(_engine_of(request))
+
+    @app.get("/v1/requests/{request_id}/trace")
+    async def request_trace(request_id: str, request: Request) -> dict:
+        """单请求完整时间线（Task 10 验收：一次请求可输出完整时间线）。"""
+        active = _engine_of(request)
+        trace_of = getattr(active.core, "trace_of", None)
+        if not callable(trace_of):
+            raise HTTPException(
+                status_code=404, detail=f"未知 request_id: {request_id}"
+            )
+        try:
+            trace = trace_of(request_id)
+        except KeyError:
+            raise HTTPException(
+                status_code=404, detail=f"未知 request_id: {request_id}"
+            ) from None
+        return trace.to_dict()
+
     @app.get("/v1/models")
     async def list_models(request: Request) -> ModelList:
         return ModelList(
@@ -332,7 +419,14 @@ def create_app(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             return StreamingResponse(
-                _completion_sse(active, request_id, request.app.state.model_id),
+                _completion_sse(
+                    active,
+                    request_id,
+                    request.app.state.model_id,
+                    include_usage=bool(
+                        body.stream_options and body.stream_options.include_usage
+                    ),
+                ),
                 media_type="text/event-stream",
                 headers=SSE_HEADERS,
             )
@@ -379,7 +473,14 @@ def create_app(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             return StreamingResponse(
-                _chat_sse(active, request_id, request.app.state.model_id),
+                _chat_sse(
+                    active,
+                    request_id,
+                    request.app.state.model_id,
+                    include_usage=bool(
+                        body.stream_options and body.stream_options.include_usage
+                    ),
+                ),
                 media_type="text/event-stream",
                 headers=SSE_HEADERS,
             )

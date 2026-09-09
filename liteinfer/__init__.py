@@ -34,6 +34,9 @@ __all__ = [
     "PagedLayerCache",
     "AsyncEngine",
     "StreamChunk",
+    "RequestMetrics",
+    "MetricsRegistry",
+    "RequestTrace",
 ]
 
 _CONFIG_NAMES = {"EngineConfig", "parse_dtype", "default_hf_cache_dir"}
@@ -50,6 +53,8 @@ _RUNNER_NAMES = {"ModelRunner", "PagedLayerCache"}
 # 注意：服务层（FastAPI）不走惰性导出——它要拉起 Web 栈，显式 `from liteinfer.server
 # import create_app` 才是预期用法，避免 import liteinfer 变慢。
 _ASYNC_NAMES = {"AsyncEngine", "StreamChunk"}
+# Task 10：可观测层（纯计算，不拉 torch/transformers，惰性导入只为 import 轻量）
+_OBSERVABILITY_NAMES = {"RequestMetrics", "MetricsRegistry", "RequestTrace"}
 
 
 def __getattr__(name: str):
@@ -120,4 +125,8 @@ def __getattr__(name: str):
             "AsyncEngine": AsyncEngine,
             "StreamChunk": StreamChunk,
         }[name]
+    if name in _OBSERVABILITY_NAMES:
+        from liteinfer import observability as _obs
+
+        return getattr(_obs, name)
     raise AttributeError(f"module 'liteinfer' has no attribute {name!r}")

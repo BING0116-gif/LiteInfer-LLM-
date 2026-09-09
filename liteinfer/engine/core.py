@@ -40,6 +40,8 @@ from liteinfer.engine.request import (
 )
 from liteinfer.model.eos import resolve_eos_ids
 from liteinfer.model.minimal.weights import load_minimal_from_hf
+from liteinfer.observability.metrics import MetricsRegistry, RequestMetrics
+from liteinfer.observability.trace import RequestTrace, build_trace
 from liteinfer.sampling.params import SamplingParams
 from liteinfer.sampling.sampler import Sampler
 
@@ -89,6 +91,9 @@ class EngineCore:
         self._device = torch.device(self.cfg.device)
         self._dtype = resolve_dtype(self.cfg.dtype, self.cfg.device)
         self.registry = RequestRegistry()
+        # Task 10：全局指标注册表。record 只发生在本类（单写者）内，
+        # snapshot 可被 HTTP 线程并发读取——dict 读侧原子，无需锁（见其 docstring）
+        self.metrics = MetricsRegistry()
         # 内部态表：request_id -> RequestState（含缓存/张量，不对外暴露）
         self._states: dict[str, RequestState] = {}
         # Task 06：调度器持有 waiting/running 双队列与预算闸门，决定每步本批跑谁。
@@ -168,6 +173,30 @@ class EngineCore:
     def get_request(self, request_id: str) -> Request:
         """读取某请求的当前状态（返回注册表中的活对象，仅供查询）。"""
         return self.registry.get(request_id)
+
+    def trace_of(self, request_id: str) -> RequestTrace:
+        """某请求的完整事件时间线（Task 10 验收：一次请求可输出完整时间线）。
+
+        非终态请求也可调用（时间线截至当前时刻）；未知 id 抛 KeyError，
+        由服务层翻译成 404。
+        """
+        st = self._states.get(request_id)
+        if st is None:
+            raise KeyError(f"未知 request_id: {request_id!r}")
+        return build_trace(st)
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        """全局指标快照：把注册表与调度器/块池的实时观测项拼在一起。
+
+        放在 core 而不是服务层：waiting/running/blocks 的真相都在这里，
+        服务层只做协议翻译（docs/02 §1 的分层），不该自己拼观测数据。
+        """
+        return self.metrics.snapshot(
+            num_waiting=self.scheduler.num_waiting,
+            num_running=self.scheduler.num_running,
+            kv_blocks_used=self.runner.paged.num_blocks_used,
+            kv_blocks_total=self.runner.paged.num_blocks_total,
+        )
 
     def cancel(self, request_id: str) -> None:
         """取消在飞请求：标记为 CANCELLED，停止继续推进，回填已生成文本。"""
@@ -265,12 +294,16 @@ class EngineCore:
         req = st.request
         req.status = RequestStatus.PREFILL
         t0 = time.perf_counter()
+        # Task 10 打点：prefill 起点即"排队结束"的时刻，TTFT 的排队段由此可归因
+        st.prefill_start_s = t0
         # 块表在被准入的这一刻才分配（waiting 期间不占物理块）；池在
         # ModelRunner 构造时于 inference_mode 之外建好，此处只写入不新建张量
         if st.cache is None:
             st.cache = self.new_block_table()
         logits = self.runner.prefill(st.prompt_ids, st.cache)
-        st.prefill_latency_s += time.perf_counter() - t0
+        t1 = time.perf_counter()
+        st.prefill_latency_s += t1 - t0
+        st.prefill_end_s = t1
         st.cached_len = req.prompt_tokens
         candidate = self.sampler.sample(logits[0, -1], req.params, st.generator)
         req.status = RequestStatus.DECODE
@@ -305,6 +338,9 @@ class EngineCore:
     def _after_emit(self, st: RequestState, token_id: int) -> RequestStepResult:
         """某 token 已 append 到 generated 后，判断是否达到 max_tokens。"""
         req = st.request
+        # Task 10 打点：token 产出时刻。与 req.generated 在同一处同步 append，
+        # 保证 token_times[i] 与 generated[i] 的下标对应关系永远成立
+        st.token_times.append(time.perf_counter())
         token_text = self.tokenizer.decode([token_id], skip_special_tokens=True)
         if len(req.generated) >= req.params.max_tokens:
             self._mark_finished(st, "length")
@@ -319,10 +355,16 @@ class EngineCore:
         结束后仍可读（Task 10 指标会消费它），所以先记账再释放。
         """
         if st.cache is None:
+            # 没碰过缓存的请求（如 waiting 中即被取消）也必须记账指标，
+            # 否则全局请求数会漏掉"从未 prefill"的失败路径
+            self.metrics.record(RequestMetrics.from_state(st))
             return
         st.cache_bytes = self.runner.bytes_for(st.cache)
         self.runner.free_table(st.cache)
         st.cache = None
+        # Task 10：终态唯一汇聚点（finish 与 cancel 都走 _release），
+        # 在这里一次性汇总请求级指标并进入全局注册表
+        self.metrics.record(RequestMetrics.from_state(st))
 
     def _mark_finished(self, st: RequestState, reason: str) -> None:
         req = st.request
